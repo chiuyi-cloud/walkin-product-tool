@@ -9,18 +9,22 @@
   // 回存後端：用檔案(file://)開啟時為純試用版（不能回存）；經伺服器開啟則打同源 API。
   const API_BASE = (location.protocol === "file:") ? null : "";
 
-  let view = "search";
+  let view = "brief";
   let quote = load();
-  // 搜尋條件
-  let f = { kw:"", type:"", cat:"", area:"", fit:"", onlyActive:true };
+  let briefOn = true; // 「找產品」時是否依客戶需求自動篩選
+  // 手動細篩（在需求結果中再搜尋）。預設只看主行程，元件可用下拉切換。
+  let f = { kw:"", type:"產品", onlyActive:true };
   // 過去提案搜尋條件
   let pf = { kw:"", city:"", duration:"", head:"", purpose:"" };
 
+  const PURPOSES = ["員工旅遊","家庭日","Team Building","ESG／志工","文化學習","休閒放鬆","DEI 工作坊","講座／工作坊","外賓接待"];
+
   function load(){
-    try{ return JSON.parse(localStorage.getItem(LS)) || newQuote(); }
+    try{ const q=JSON.parse(localStorage.getItem(LS)); return q? Object.assign(newQuote(), q) : newQuote(); }
     catch(e){ return newQuote(); }
   }
-  function newQuote(){ return { customer:"", headcount:30, markup:20, lines:[] }; }
+  function newQuote(){ return { customer:"", headcount:30, budgetPP:"", areas:[], duration:"", purposes:[], needNote:"", markup:20, lines:[] }; }
+  function toggleArr(key,val){ quote[key]=quote[key]||[]; const i=quote[key].indexOf(val); if(i>=0)quote[key].splice(i,1); else quote[key].push(val); save(); }
   function save(){ localStorage.setItem(LS, JSON.stringify(quote)); }
 
   function esc(s){ return (s==null?"":String(s)).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
@@ -58,31 +62,37 @@
     nc.textContent = quote.lines.length;
     document.getElementById("snapInfo").textContent = ALL.length + " 項產品";
     const titles={
-      search:["產品搜尋","依客戶需求快速找到合適行程與元件"],
-      quote:["報價試算","疊加元件、套利潤，自動算出總價與人均"],
-      proposal:["提案產生","依選定行程與報價，產出提案草稿"],
-      past:["過去提案搜尋","291 筆歷史提案，依需求找最接近的舊案參考"],
+      brief:["① 客戶需求","先記下這次客戶的需求，後面依需求推薦產品"],
+      search:["② 找產品・規劃行程","依客戶需求篩選合適行程，並參考相似的過去提案"],
+      quote:["③ 報價試算","把選好的行程與元件算出成本、售價與每人單價"],
+      proposal:["④ 提案產生","依選定行程與報價，產出提案草稿"],
+      past:["過去提案參考","291 筆歷史提案，依需求找最接近的舊案參考"],
     };
-    const t=titles[view];
+    const t=titles[view]||titles.brief;
     document.getElementById("pageTitle").textContent=t[0];
     document.getElementById("pageSub").textContent=t[1];
     const c=document.getElementById("content");
-    if(view==="search") c.innerHTML=renderSearch();
+    if(view==="brief") c.innerHTML=renderBrief();
+    else if(view==="search") c.innerHTML=renderSearch();
     else if(view==="quote") c.innerHTML=renderQuote();
     else if(view==="proposal") c.innerHTML=renderProposal();
     else if(view==="past") c.innerHTML=renderPast();
     bind();
   }
 
-  // ---------- 搜尋 ----------
+  // ---------- 找產品（依需求篩選）----------
   function applyFilters(){
     const kw=f.kw.trim().toLowerCase();
+    const bAreas=(quote.areas||[]);
+    const h=parseInt(quote.headcount)||0;
     return ALL.filter(p=>{
       if(f.onlyActive && !p.active) return false;
       if(f.type && p.type!==f.type) return false;
-      if(f.cat && p.category!==f.cat) return false;
-      if(f.area && !(p.area||[]).includes(f.area)) return false;
-      if(f.fit){ const h=parseInt(f.fit); if(h && !fitsHeadcount(p,h)) return false; }
+      // 依客戶需求篩選（只套用在主行程；元件是成本積木不分地區）
+      if(briefOn && p.type==="產品"){
+        if(bAreas.length && !(p.area||[]).some(a=>bAreas.includes(a))) return false;
+        if(h && !fitsHeadcount(p,h)) return false;
+      }
       if(kw){
         const hay=[p.name,p.category,(p.topics||[]).join(" "),(p.esg||[]).join(" "),(p.area||[]).join(" "),p.note,p.priceRange].join(" ").toLowerCase();
         if(!hay.includes(kw)) return false;
@@ -97,44 +107,103 @@
     return "定價未定（需客製）";
   }
 
+  function productCard(p){
+    const topics=(p.topics||[]).slice(0,3).map(t=>`<span class="tag topic">${esc(t)}</span>`).join("");
+    const esgs=(p.esg||[]).slice(0,2).map(t=>`<span class="tag esg">♻ ${esc(t)}</span>`).join("");
+    const driveLink=extractDrive(p.note);
+    return `<div class="card pcard">
+      <div class="ptags"><span class="tag cat">${esc(p.category)}</span>${(p.area||[]).map(a=>`<span class="tag area">${esc(a)}</span>`).join("")}</div>
+      <h3>${esc(p.name)}</h3>
+      <div class="price">${priceLabel(p)}</div>
+      ${p.capacity?`<div class="meta">建議人數：${esc(p.capacity)}</div>`:""}
+      ${p.noServe?`<div class="meta">⛔ ${esc(p.noServe)}</div>`:""}
+      ${(topics||esgs)?`<div class="ptags">${topics}${esgs}</div>`:""}
+      ${p.note?`<div class="note">${esc(p.note).slice(0,150)}${p.note.length>150?"…":""}</div>`:""}
+      <div class="row"><button class="btn sm" data-add="${esc(p.id)}">＋ 加入規劃</button>
+        ${p.url?`<a class="link" href="${esc(p.url)}" target="_blank" rel="noopener">官網↗</a>`:""}
+        ${driveLink?`<a class="link" href="${esc(driveLink)}" target="_blank" rel="noopener">素材↗</a>`:""}
+      </div></div>`;
+  }
+
+  // 依需求（活動目的、人數）找相似的過去提案
+  function matchPurpose(briefP, propP){
+    if(!propP) return false;
+    const map={"Team Building":["TB","Team"],"ESG／志工":["ESG","志工"],"員工旅遊":["員工旅遊","休閒放鬆"],
+      "家庭日":["家庭日"],"文化學習":["文化學習"],"休閒放鬆":["休閒放鬆"],"DEI 工作坊":["DEI"],
+      "講座／工作坊":["講座","工作坊"],"外賓接待":["外賓","接待"]};
+    return (map[briefP]||[briefP]).some(k=>propP.indexOf(k)>=0);
+  }
+  function briefProposals(){
+    const ps=quote.purposes||[]; const h=parseInt(quote.headcount)||0;
+    const band=h?(h<=25?"0-25":h<=80?"26-80":h<=200?"81-200":"201-"):"";
+    if(!ps.length && !band) return [];
+    return PROPOSALS.filter(p=>{
+      const pm=ps.length && ps.some(x=>matchPurpose(x,p.purpose));
+      const hm=band && p.headcount===band;
+      return pm || (ps.length?false:hm); // 有選目的就以目的為主，否則用人數
+    }).slice(0,6);
+  }
+
+  function needsSummary(){
+    const a=(quote.areas||[]).join("、")||"不限";
+    const pp=(quote.purposes||[]).join("、")||"不限";
+    return `<div class="card needbar">
+      <span class="lbl">本次需求</span>
+      <span class="desc">${quote.customer?esc(quote.customer)+"｜":""}人數 ${quote.headcount||"—"}｜地區 ${esc(a)}｜目的 ${esc(pp)}${quote.duration?"｜"+esc(quote.duration):""}${quote.budgetPP?"｜每人預算 "+nf(quote.budgetPP):""}</span>
+      <label style="font-size:12.5px;display:flex;gap:5px;align-items:center;margin-left:auto"><input type="checkbox" id="briefToggle" ${briefOn?"checked":""}>依需求篩選</label>
+      <button class="btn ghost sm" data-go="brief">調整需求</button>
+    </div>`;
+  }
+
   function renderSearch(){
+    const hasBrief=(quote.areas||[]).length||(quote.purposes||[]).length||quote.budgetPP;
+    if(!hasBrief && !f.kw){
+      return needsSummary()+`<div class="hint info">先到「① 客戶需求」填寫，這裡會依需求自動篩出合適行程；也可直接用下方關鍵字搜尋。</div>`+searchBody();
+    }
+    return needsSummary()+searchBody();
+  }
+
+  function searchBody(){
     const list=applyFilters();
-    const opt=(arr,sel)=>arr.map(v=>`<option ${v===sel?"selected":""}>${esc(v)}</option>`).join("");
+    const props = briefOn ? briefProposals() : [];
+    const propPanel = props.length ? `<div style="margin-bottom:18px">
+        <div style="font-weight:800;font-size:14px;margin-bottom:8px">💡 相似的過去提案（參考客單與行程組合）</div>
+        <div class="pgrid">${props.map(proposalCard).join("")}</div>
+      </div>` : "";
     const filters=`<div class="filters">
-      <div class="fg" style="flex:1"><label>關鍵字（行程名、主題、ESG…）</label>
-        <input class="inp search-inp" id="f_kw" value="${esc(f.kw)}" placeholder="例：淨灘、大稻埕、家庭日、永續"></div>
-      <div class="fg"><label>類型</label><select id="f_type"><option value="">全部</option><option value="產品" ${f.type==="產品"?"selected":""}>主行程（產品）</option><option value="元件" ${f.type==="元件"?"selected":""}>成本元件</option></select></div>
-      <div class="fg"><label>分類</label><select id="f_cat"><option value="">全部分類</option>${opt(CATS,f.cat)}</select></div>
-      <div class="fg"><label>地區</label><select id="f_area"><option value="">全部地區</option>${opt(AREAS,f.area)}</select></div>
-      <div class="fg"><label>適合人數</label><input class="inp" id="f_fit" style="width:90px" value="${esc(f.fit)}" placeholder="如 40" inputmode="numeric"></div>
+      <div class="fg" style="flex:1"><label>在結果中再搜尋（關鍵字）</label>
+        <input class="inp search-inp" id="f_kw" value="${esc(f.kw)}" placeholder="例：淨灘、大稻埕、印花樂、藍色公路"></div>
+      <div class="fg"><label>類型</label><select id="f_type"><option value="">全部</option><option value="產品" ${f.type==="產品"?"selected":""}>主行程</option><option value="元件" ${f.type==="元件"?"selected":""}>成本元件</option></select></div>
       <button class="btn ghost sm" id="f_clear">清除</button>
     </div>`;
-    const cards = list.slice(0,300).map(p=>{
-      const topics=(p.topics||[]).slice(0,3).map(t=>`<span class="tag topic">${esc(t)}</span>`).join("");
-      const esgs=(p.esg||[]).slice(0,2).map(t=>`<span class="tag esg">♻ ${esc(t)}</span>`).join("");
-      const driveLink = extractDrive(p.note);
-      return `<div class="card pcard">
-        <div class="ptags">
-          <span class="tag cat">${esc(p.category)}</span>
-          ${(p.area||[]).map(a=>`<span class="tag area">${esc(a)}</span>`).join("")}
-        </div>
-        <h3>${esc(p.name)}</h3>
-        <div class="price">${priceLabel(p)}</div>
-        ${p.capacity?`<div class="meta">建議人數：${esc(p.capacity)}</div>`:""}
-        ${p.noServe?`<div class="meta">⛔ ${esc(p.noServe)}</div>`:""}
-        ${(topics||esgs)?`<div class="ptags">${topics}${esgs}</div>`:""}
-        ${p.note?`<div class="note">${esc(p.note).slice(0,150)}${p.note.length>150?"…":""}</div>`:""}
-        <div class="row">
-          <button class="btn sm" data-add="${esc(p.id)}">＋ 加入報價</button>
-          ${p.url?`<a class="link" href="${esc(p.url)}" target="_blank" rel="noopener">官網↗</a>`:""}
-          ${driveLink?`<a class="link" href="${esc(driveLink)}" target="_blank" rel="noopener">素材↗</a>`:""}
-        </div>
-      </div>`;
-    }).join("");
-    return `<div class="hint info">🔍 共 <b>${ALL.length}</b> 項產品（主行程 + 成本元件）。用關鍵字或篩選找到合適項目，點「加入報價」帶進報價試算。資料為 Zoho 快照。</div>
-      ${filters}
+    const cards = list.slice(0,300).map(productCard).join("");
+    return propPanel + filters +
+      `<div style="font-weight:800;font-size:14px;margin:6px 0 8px">符合需求的產品</div>
       <div class="count">符合條件：<b>${list.length}</b> 項${list.length>300?"（僅顯示前 300）":""}</div>
-      <div class="pgrid">${cards||'<div class="empty">沒有符合條件的產品</div>'}</div>`;
+      <div class="pgrid" id="prodgrid">${cards||'<div class="empty">沒有符合條件的產品（可放寬需求或關掉「依需求篩選」）</div>'}</div>`;
+  }
+
+  // ---------- 客戶需求 ----------
+  function renderBrief(){
+    const areaChips=AREAS.map(a=>`<button class="chip ${(quote.areas||[]).includes(a)?"on":""}" data-area="${esc(a)}">${esc(a)}</button>`).join("");
+    const purpChips=PURPOSES.map(p=>`<button class="chip ${(quote.purposes||[]).includes(p)?"on":""}" data-purpose="${esc(p)}">${esc(p)}</button>`).join("");
+    const durChips=["半日","一日","多日"].map(d=>`<button class="chip ${quote.duration===d?"on":""}" data-dur="${esc(d)}">${esc(d)}</button>`).join("");
+    return `<div class="hint info">📝 第一步：先記下這次客戶的需求。填完按「依需求找產品」，系統會幫你篩出合適行程，並列出相似的過去提案參考。</div>
+    <div class="card" style="padding:22px;max-width:780px">
+      <div class="row2">
+        <label class="bfld"><span>客戶名稱</span><input class="inp" id="b_customer" value="${esc(quote.customer)}" placeholder="企業名稱"></label>
+        <label class="bfld"><span>人數</span><input class="inp" type="number" id="b_head" value="${esc(quote.headcount)}"></label>
+      </div>
+      <label class="bfld"><span>每人預算（選填）</span><input class="inp" type="number" id="b_budget" value="${esc(quote.budgetPP||"")}" placeholder="如 2000，之後可用來提醒是否超預算"></label>
+      <div class="bfld"><span>目的地／地區（可多選）</span><div class="chips" id="areaChips">${areaChips}</div></div>
+      <div class="bfld"><span>天數／時長</span><div class="chips">${durChips}</div></div>
+      <div class="bfld"><span>活動目的（可多選）</span><div class="chips" id="purpChips">${purpChips}</div></div>
+      <label class="bfld"><span>想達成的目的／其他需求</span><textarea class="inp" id="b_note" rows="3" placeholder="例：促進跨部門交流、結合 ESG 淨灘、預算有限希望半日…">${esc(quote.needNote||"")}</textarea></label>
+      <div style="display:flex;gap:10px;margin-top:6px">
+        <button class="btn" id="b_go">依需求找產品 →</button>
+        <button class="btn ghost" id="b_reset">清空需求</button>
+      </div>
+    </div>`;
   }
 
   function extractDrive(note){
@@ -186,15 +255,23 @@
         <div style="margin-top:12px"><button class="btn ghost" data-go="search">前往產品搜尋</button></div></div>`;
     }
     const t=totals();
-    const rows=quote.lines.map((l,i)=>`<tr>
+    const noPriceCount = quote.lines.filter(l=>!(Number(l.unitPrice)>0)).length;
+    const rows=quote.lines.map((l,i)=>{
+      const noPrice = !(Number(l.unitPrice)>0);
+      const sub = (Number(l.qty)||0)*(Number(l.unitPrice)||0);
+      const nameNote = l.priceRange
+        ? `<div style="font-size:11px;color:var(--muted)">參考定價：${esc(l.priceRange)}</div>`
+        : (noPrice && l.type==="產品" ? `<div style="font-size:11px;color:var(--danger)">⚠️ Zoho 無定價，請填每人售價</div>` : "");
+      return `<tr>
       <td><span class="pill ${l.type==="產品"?"prod":"comp"}">${l.type==="產品"?"行程":"元件"}</span></td>
-      <td>${esc(l.name)}${l.priceRange&&l.unitPrice===0?`<div style="font-size:11px;color:var(--muted)">參考定價：${esc(l.priceRange)}</div>`:""}</td>
+      <td>${esc(l.name)}${nameNote}</td>
       <td class="num"><input class="qty-inp" type="number" min="0" data-q="${i}" value="${esc(l.qty)}"></td>
       <td style="color:var(--muted);font-size:12px">${esc(l.unit)}</td>
-      <td class="num"><input class="price-inp" type="number" min="0" data-p="${i}" value="${esc(l.unitPrice)}"></td>
-      <td class="num"><b>${nf((Number(l.qty)||0)*(Number(l.unitPrice)||0))}</b></td>
+      <td class="num"><input class="price-inp" type="number" min="0" data-p="${i}" value="${esc(l.unitPrice)}" style="${noPrice?'border-color:#dc2626;background:#fff7f7':''}"></td>
+      <td class="num"><b>${nf(sub)}</b></td>
       <td><button class="lineDel" data-del="${i}" title="移除">×</button></td>
-    </tr>`).join("");
+    </tr>`;}).join("");
+    const warnBanner = noPriceCount ? `<div class="hint" style="margin:0;border-radius:0;border-left:none;border-right:none">⚠️ 有 <b>${noPriceCount}</b> 個項目尚未填單價（Zoho 無定價），報價尚未完整——請在「單價」欄填入金額。</div>` : "";
     return `<div class="qwrap">
       <div class="card" style="overflow:hidden">
         <div style="display:flex;gap:14px;flex-wrap:wrap;padding:14px 16px;border-bottom:1px solid var(--line)">
@@ -203,6 +280,7 @@
           <div class="fg"><label>利潤加成 %</label><input class="inp" id="q_markup" type="number" min="0" style="width:90px" value="${esc(quote.markup)}"></div>
           <div class="fg" style="justify-content:flex-end"><button class="btn ghost sm" id="q_headfill">人數套用到「以人計價」項目</button></div>
         </div>
+        ${warnBanner}
         <div style="overflow:auto"><table>
           <thead><tr><th></th><th>項目</th><th class="num">數量</th><th>單位</th><th class="num">單價</th><th class="num">小計</th><th></th></tr></thead>
           <tbody>${rows}</tbody>
@@ -356,15 +434,24 @@
     const c=document.getElementById("content");
     c.querySelectorAll("[data-go]").forEach(el=>el.onclick=()=>{ view=el.dataset.go; render(); });
 
-    // 搜尋篩選
+    // 客戶需求表單
+    const bc=document.getElementById("b_customer"); if(bc) bc.oninput=()=>{ quote.customer=bc.value; save(); };
+    const bh=document.getElementById("b_head"); if(bh) bh.oninput=()=>{ quote.headcount=parseInt(bh.value)||0; save(); };
+    const bbg=document.getElementById("b_budget"); if(bbg) bbg.oninput=()=>{ quote.budgetPP=parseInt(bbg.value)||""; save(); };
+    const bn=document.getElementById("b_note"); if(bn) bn.oninput=()=>{ quote.needNote=bn.value; save(); };
+    c.querySelectorAll("[data-area]").forEach(el=>el.onclick=()=>{ toggleArr("areas",el.dataset.area); render(); });
+    c.querySelectorAll("[data-purpose]").forEach(el=>el.onclick=()=>{ toggleArr("purposes",el.dataset.purpose); render(); });
+    c.querySelectorAll("[data-dur]").forEach(el=>el.onclick=()=>{ quote.duration = quote.duration===el.dataset.dur?"":el.dataset.dur; save(); render(); });
+    const bgo=document.getElementById("b_go"); if(bgo) bgo.onclick=()=>{ briefOn=true; view="search"; render(); };
+    const brs=document.getElementById("b_reset"); if(brs) brs.onclick=()=>{ if(confirm("清空目前的客戶需求？（已加入的報價項目不受影響）")){ quote.customer="";quote.headcount=30;quote.budgetPP="";quote.areas=[];quote.duration="";quote.purposes=[];quote.needNote=""; save(); render(); } };
+
+    // 找產品：依需求篩選開關 + 在結果中再搜尋
+    const bt=document.getElementById("briefToggle"); if(bt) bt.onchange=()=>{ briefOn=bt.checked; render(); };
     const kw=document.getElementById("f_kw");
     if(kw){
-      let tmr;
-      kw.oninput=()=>{ clearTimeout(tmr); tmr=setTimeout(()=>{ f.kw=kw.value; rerenderSearch(); },200); };
-      const bindSel=(id,key)=>{ const el=document.getElementById(id); if(el) el.onchange=()=>{ f[key]=el.value; rerenderSearch(); }; };
-      bindSel("f_type","type"); bindSel("f_cat","cat"); bindSel("f_area","area");
-      const fit=document.getElementById("f_fit"); if(fit) fit.oninput=()=>{ let tm; clearTimeout(fit._t); fit._t=setTimeout(()=>{ f.fit=fit.value; rerenderSearch(); },250); };
-      document.getElementById("f_clear").onclick=()=>{ f={kw:"",type:"",cat:"",area:"",fit:"",onlyActive:true}; render(); };
+      let tmr; kw.oninput=()=>{ clearTimeout(tmr); tmr=setTimeout(()=>{ f.kw=kw.value; rerenderSearch(); },200); };
+      const ft=document.getElementById("f_type"); if(ft) ft.onchange=()=>{ f.type=ft.value; rerenderSearch(); };
+      const fclr=document.getElementById("f_clear"); if(fclr) fclr.onclick=()=>{ f={kw:"",type:"產品",onlyActive:true}; render(); };
     }
     c.querySelectorAll("[data-add]").forEach(el=>el.onclick=()=>{ addLine(el.dataset.add); render(); });
 
@@ -405,27 +492,10 @@
 
   function rerenderSearch(){
     const c=document.getElementById("content");
-    // 只重繪清單與計數，保留輸入焦點
     const list=applyFilters();
     const cnt=c.querySelector(".count"); if(cnt) cnt.innerHTML=`符合條件：<b>${list.length}</b> 項${list.length>300?"（僅顯示前 300）":""}`;
-    const grid=c.querySelector(".pgrid"); if(!grid) return;
-    grid.innerHTML = list.slice(0,300).map(p=>{
-      const topics=(p.topics||[]).slice(0,3).map(t=>`<span class="tag topic">${esc(t)}</span>`).join("");
-      const esgs=(p.esg||[]).slice(0,2).map(t=>`<span class="tag esg">♻ ${esc(t)}</span>`).join("");
-      const driveLink=extractDrive(p.note);
-      return `<div class="card pcard">
-        <div class="ptags"><span class="tag cat">${esc(p.category)}</span>${(p.area||[]).map(a=>`<span class="tag area">${esc(a)}</span>`).join("")}</div>
-        <h3>${esc(p.name)}</h3>
-        <div class="price">${priceLabel(p)}</div>
-        ${p.capacity?`<div class="meta">建議人數：${esc(p.capacity)}</div>`:""}
-        ${p.noServe?`<div class="meta">⛔ ${esc(p.noServe)}</div>`:""}
-        ${(topics||esgs)?`<div class="ptags">${topics}${esgs}</div>`:""}
-        ${p.note?`<div class="note">${esc(p.note).slice(0,150)}${p.note.length>150?"…":""}</div>`:""}
-        <div class="row"><button class="btn sm" data-add="${esc(p.id)}">＋ 加入報價</button>
-          ${p.url?`<a class="link" href="${esc(p.url)}" target="_blank" rel="noopener">官網↗</a>`:""}
-          ${driveLink?`<a class="link" href="${esc(driveLink)}" target="_blank" rel="noopener">素材↗</a>`:""}
-        </div></div>`;
-    }).join("")||'<div class="empty">沒有符合條件的產品</div>';
+    const grid=document.getElementById("prodgrid"); if(!grid) return;
+    grid.innerHTML = list.slice(0,300).map(productCard).join("")||'<div class="empty">沒有符合條件的產品</div>';
     grid.querySelectorAll("[data-add]").forEach(el=>el.onclick=()=>{ addLine(el.dataset.add); render(); });
   }
 

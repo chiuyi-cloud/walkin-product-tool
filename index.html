@@ -96,6 +96,17 @@
   pre.draft{background:var(--soft);border-radius:10px;padding:14px;font-size:13px;white-space:pre-wrap;font-family:inherit;line-height:1.7;max-height:52vh;overflow:auto}
   .pill{display:inline-block;padding:2px 9px;border-radius:999px;font-size:11px;font-weight:700}
   .pill.prod{background:#fef3c7;color:#92400e}.pill.comp{background:#e0e7ff;color:#3730a3}
+  /* 客戶需求表單 */
+  .bfld{display:block;margin-bottom:16px}
+  .bfld>span{display:block;font-size:12.5px;font-weight:700;color:#475569;margin-bottom:6px}
+  .chips{display:flex;flex-wrap:wrap;gap:8px}
+  .chip{border:1px solid var(--line);background:#fff;color:var(--ink);padding:7px 14px;border-radius:999px;font-size:13px}
+  .chip:hover{border-color:var(--brand)}
+  .chip.on{background:var(--brand);color:#fff;border-color:var(--brand)}
+  textarea.inp{width:100%;font-family:inherit;resize:vertical}
+  .needbar{display:flex;gap:14px;align-items:center;flex-wrap:wrap;padding:12px 16px;margin-bottom:14px}
+  .needbar .lbl{font-weight:800}
+  .needbar .desc{color:var(--muted);font-size:13px}
 </style>
 </head>
 <body>
@@ -103,10 +114,11 @@
   <aside class="side">
     <div class="logo">島內散步<small>產品與報價工具 ｜ 2B 業務</small></div>
     <nav class="nav" id="nav">
-      <a data-view="search" class="active"><span>🔍</span>產品搜尋</a>
-      <a data-view="quote"><span>🧮</span>報價試算<span class="badge" id="navCount" style="display:none">0</span></a>
-      <a data-view="proposal"><span>📄</span>提案產生</a>
-      <a data-view="past"><span>🗂️</span>過去提案</a>
+      <a data-view="brief" class="active"><span>📝</span>① 客戶需求</a>
+      <a data-view="search"><span>🔍</span>② 找產品・規劃</a>
+      <a data-view="quote"><span>🧮</span>③ 報價試算<span class="badge" id="navCount" style="display:none">0</span></a>
+      <a data-view="proposal"><span>📄</span>④ 提案產生</a>
+      <a data-view="past"><span>🗂️</span>過去提案參考</a>
     </nav>
     <div style="padding:10px 12px"><button class="btn" id="feedbackBtn" style="width:100%;background:rgba(255,255,255,.16)">💬 意見回饋</button></div>
     <div class="foot">產品資料：Zoho 快照<br><span id="snapInfo">—</span><br>試用版 v0.1</div>
