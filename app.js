@@ -108,6 +108,9 @@
         if(!hay.includes(kw)) return false;
       }
       return true;
+    }).sort((a,b)=>{
+      if(!kw) return 0;
+      return (b.name.toLowerCase().includes(kw)?1:0)-(a.name.toLowerCase().includes(kw)?1:0); // 名稱命中者排前面
     });
   }
 
@@ -230,32 +233,34 @@
     const p=ALL.find(x=>x.id===id); if(!p) return;
     if(quote.lines.find(l=>l.id===id)){ toast("已在報價單中"); return; }
     const perPerson = p.unit==="人";
-    let unitPrice = p.unitPrice!=null ? p.unitPrice : 0;
+    const multiDay = (quote.duration==="二日"||quote.duration==="三日");
+    // 元件用 Zoho 單價；主行程不帶全日價（當作參考售價，成本改由元件組成）
+    let unitPrice = p.type==="產品" ? 0 : (p.unitPrice!=null ? p.unitPrice : 0);
     let qty = perPerson ? (quote.headcount||1) : 1;
-    // 主行程：自動帶入定價區間低標當參考單價；數量依計價方式判斷
-    if(p.type==="產品" && !unitPrice){
-      const ref = firstPrice(p.priceRange);
-      if(ref){
-        unitPrice = ref;
-        const pr = p.priceRange || "";
-        if(/場/.test(pr)) qty = 1;                          // 「一場/每場」整團計價
-        else if(/人/.test(pr) || perPerson) qty = quote.headcount||1;  // 每人計價 → ×人數
-        else qty = 1;                                       // 不確定 → 先 1，業務再調
-      }
-    }
-    // 行程分段：加入「主行程」會開一個新行程段；加入「元件」歸到目前作用中的行程段
+    // 方案分段：二日/三日 → 同一個方案（兩天放一起）；半日/一日 → 每個主行程各一個方案（各一張 sheet）
     let group;
-    if(p.type==="產品"){ group = shortName(p.name); activeGroup = group; }
-    else { group = activeGroup || "共用元件"; }
+    if(p.type==="產品"){
+      group = multiDay ? (activeGroup || (quote.duration+"行程方案")) : shortName(p.name);
+      activeGroup = group;
+    } else {
+      group = activeGroup || "其他元件";
+    }
     quote.lines.push({
       id:p.id, name:p.name, type:p.type, unit:p.unit||"項",
       qty, unitPrice, priceRange:p.priceRange||"", group
     });
-    save(); toast("已加入："+p.name+"（行程段："+group+"）");
+    // 二日/三日：方案內若還沒有住宿，自動補一筆住宿（提醒填價）
+    if(multiDay && p.type==="產品" && !quote.lines.some(l=>(l.group===group)&&/住宿/.test(l.name))){
+      const acc=ALL.find(x=>x.type==="元件"&&x.name.indexOf("住宿")>=0&&x.active);
+      if(acc) quote.lines.push({ id:acc.id, name:acc.name, type:"元件", unit:acc.unit||"人", qty:quote.headcount||1, unitPrice:acc.unitPrice||0, priceRange:"", group });
+    }
+    save(); toast("已加入："+p.name+"（方案："+group+"）");
   }
   function shortName(name){ return String(name).split(/[｜|]/)[0].slice(0,18) || name.slice(0,18); }
+  // 快速加入常用成本元件（跳到找產品並篩好）
+  const QUICK_COMP=[{l:"住宿",kw:"住宿"},{l:"餐食",kw:"餐"},{l:"交通",kw:"交通"},{l:"保險",kw:"保險"},{l:"導覽",kw:"導覽員"},{l:"帶路人",kw:"帶路人"}];
   // 依插入順序取得行程段清單
-  function groupsOf(){ const seen=[]; quote.lines.forEach(l=>{ const g=l.group||"共用元件"; if(!seen.includes(g)) seen.push(g); }); return seen; }
+  function groupsOf(){ const seen=[]; quote.lines.forEach(l=>{ const g=l.group||"其他元件"; if(!seen.includes(g)) seen.push(g); }); return seen; }
 
   function totals(){
     const cost = quote.lines.reduce((s,l)=>s + (Number(l.qty)||0)*(Number(l.unitPrice)||0), 0);
@@ -272,27 +277,29 @@
         <div style="margin-top:12px"><button class="btn ghost" data-go="search">前往產品搜尋</button></div></div>`;
     }
     const t=totals();
-    const noPriceCount = quote.lines.filter(l=>!(Number(l.unitPrice)>0)).length;
+    // 只有「元件」沒填單價才算缺價（主行程是參考售價，不列入成本）
+    const noPriceCount = quote.lines.filter(l=>l.type!=="產品" && !(Number(l.unitPrice)>0)).length;
     const groups = groupsOf();
-    const moveOpts = [...new Set([...groups,"共用元件"])];
+    const moveOpts = [...new Set([...groups,"其他元件"])];
     function lineRow(l,i){
-      const noPrice = !(Number(l.unitPrice)>0);
+      const isProd = l.type==="產品";
+      const noPrice = !isProd && !(Number(l.unitPrice)>0);   // 元件缺價才標紅
       const sub = (Number(l.qty)||0)*(Number(l.unitPrice)||0);
-      const nameNote = l.priceRange
-        ? `<div style="font-size:11px;color:var(--muted)">參考定價：${esc(l.priceRange)}</div>`
-        : (noPrice && l.type==="產品" ? `<div style="font-size:11px;color:var(--danger)">⚠️ Zoho 無定價，請填每人售價</div>` : "");
+      const nameNote = isProd
+        ? `<div style="font-size:11px;color:var(--muted)">參考售價：${l.priceRange?esc(l.priceRange):"未定"}（成本請用下方元件組成，不列入成本）</div>`
+        : (noPrice ? `<div style="font-size:11px;color:var(--danger)">⚠️ 請填單價</div>` : "");
       return `<tr>
-        <td><span class="pill ${l.type==="產品"?"prod":"comp"}">${l.type==="產品"?"行程":"元件"}</span></td>
+        <td><span class="pill ${isProd?"prod":"comp"}">${isProd?"行程":"元件"}</span></td>
         <td>${esc(l.name)}${nameNote}</td>
         <td class="num"><input class="qty-inp" type="number" min="0" data-q="${i}" value="${esc(l.qty)}"></td>
         <td style="color:var(--muted);font-size:12px">${esc(l.unit)}</td>
         <td class="num"><input class="price-inp" type="number" min="0" data-p="${i}" value="${esc(l.unitPrice)}" style="${noPrice?'border-color:#dc2626;background:#fff7f7':''}"></td>
         <td class="num"><b>${nf(sub)}</b></td>
-        <td style="white-space:nowrap"><select class="grp-move" data-move="${i}" title="移到行程段" style="font-size:11px;padding:3px;max-width:90px">${moveOpts.map(o=>`<option ${o===(l.group||"共用元件")?"selected":""}>${esc(o)}</option>`).join("")}</select> <button class="lineDel" data-del="${i}" title="移除">×</button></td>
+        <td style="white-space:nowrap"><select class="grp-move" data-move="${i}" title="移到方案" style="font-size:11px;padding:3px;max-width:90px">${moveOpts.map(o=>`<option ${o===(l.group||"其他元件")?"selected":""}>${esc(o)}</option>`).join("")}</select> <button class="lineDel" data-del="${i}" title="移除">×</button></td>
       </tr>`;
     }
     const body = groups.map(g=>{
-      const items = quote.lines.map((l,i)=>({l,i})).filter(x=>(x.l.group||"共用元件")===g);
+      const items = quote.lines.map((l,i)=>({l,i})).filter(x=>(x.l.group||"其他元件")===g);
       const gsub = items.reduce((s,x)=>s+(Number(x.l.qty)||0)*(Number(x.l.unitPrice)||0),0);
       const header = `<tr style="background:#fff7ed">
         <td style="text-align:center">🧭</td>
@@ -301,8 +308,12 @@
         <td class="num"><b>${nf(gsub)}</b></td><td></td></tr>`;
       return header + items.map(x=>lineRow(x.l,x.i)).join("");
     }).join("");
-    const warnBanner = noPriceCount ? `<div class="hint" style="margin:0;border-radius:0;border-left:none;border-right:none">⚠️ 有 <b>${noPriceCount}</b> 個項目尚未填單價（Zoho 無定價），報價尚未完整——請在「單價」欄填入金額。</div>` : "";
-    const dayHint = (quote.duration==="二日"||quote.duration==="三日") ? `<div class="hint" style="margin:0;border-radius:0;border-left:none;border-right:none;background:#eff6ff;border-color:#bfdbfe;color:#1e40af">🗓️ ${esc(quote.duration)}行程：每天各加一個主行程（會各成一個行程段），記得補上<b>住宿</b>與各天的餐食／交通元件。可用每列右側下拉把元件移到對應行程段。</div>` : "";
+    const warnBanner = noPriceCount ? `<div class="hint" style="margin:0;border-radius:0;border-left:none;border-right:none">⚠️ 有 <b>${noPriceCount}</b> 個元件尚未填單價——請在「單價」欄填入金額。</div>` : "";
+    const dayHint = (quote.duration==="二日"||quote.duration==="三日") ? `<div class="hint" style="margin:0;border-radius:0;border-left:none;border-right:none;background:#eff6ff;border-color:#bfdbfe;color:#1e40af">🗓️ ${esc(quote.duration)}行程＝同一個方案（同一張報價分頁）：兩天的行程都加進來，已自動帶入<b>住宿</b>一列，記得補各天的餐食／交通／導覽元件並填價。</div>` : "";
+    const quickRow = `<div style="padding:9px 16px;border-bottom:1px solid var(--line);display:flex;gap:6px;align-items:center;flex-wrap:wrap;font-size:12.5px">
+      <span style="color:var(--muted)">快速加成本元件（看得到單價）：</span>
+      ${QUICK_COMP.map(q=>`<button class="btn ghost sm" data-quick="${esc(q.kw)}">＋${esc(q.l)}</button>`).join("")}
+    </div>`;
     return `<div class="qwrap">
       <div class="card" style="overflow:hidden">
         <div style="display:flex;gap:14px;flex-wrap:wrap;padding:14px 16px;border-bottom:1px solid var(--line)">
@@ -311,9 +322,9 @@
           <div class="fg"><label>利潤加成 %</label><input class="inp" id="q_markup" type="number" min="0" style="width:90px" value="${esc(quote.markup)}"></div>
           <div class="fg" style="justify-content:flex-end"><button class="btn ghost sm" id="q_headfill">人數套用到「以人計價」項目</button></div>
         </div>
-        ${dayHint}${warnBanner}
+        ${quickRow}${dayHint}${warnBanner}
         <div style="overflow:auto"><table>
-          <thead><tr><th></th><th>項目</th><th class="num">數量</th><th>單位</th><th class="num">單價</th><th class="num">小計</th><th>行程段</th></tr></thead>
+          <thead><tr><th></th><th>項目</th><th class="num">數量</th><th>單位</th><th class="num">單價</th><th class="num">小計</th><th>方案</th></tr></thead>
           <tbody>${body}</tbody>
         </table></div>
       </div>
@@ -331,7 +342,7 @@
             <button class="btn ghost sm" id="q_clear">清空</button>
           </div>
         </div>
-        <div class="hint" style="margin-top:14px">主行程（行程）的定價多為「每人區間」，加入後單價預設 0，請參考列上的「參考定價」依人數填入每人售價或整團成本。</div>
+        <div class="hint" style="margin-top:14px">💡 主行程的「參考售價」只是過去成交價參考，<b>不列入成本</b>。實際成本請用上方「快速加成本元件」把導覽、餐食、交通、保險、住宿等加進來，每個元件都看得到單價，方便你掌握成本結構並自行調整。</div>
       </div>
     </div>`;
   }
@@ -369,7 +380,7 @@
     L.push(`## 報價明細（依行程段）`);
     L.push("");
     groupsOf().forEach(g=>{
-      const items=quote.lines.filter(l=>(l.group||"共用元件")===g);
+      const items=quote.lines.filter(l=>(l.group||"其他元件")===g);
       const gsub=items.reduce((s,l)=>s+(Number(l.qty)||0)*(Number(l.unitPrice)||0),0);
       L.push(`**${g}**`);
       L.push("| 項目 | 數量 | 單位 | 單價 | 小計 |");
@@ -507,11 +518,13 @@
     c.querySelectorAll("[data-grename]").forEach(el=>el.onchange=()=>{
       const oldG=el.dataset.grename, newG=el.value.trim()||oldG;
       if(newG===oldG) return;
-      quote.lines.forEach(l=>{ if((l.group||"共用元件")===oldG) l.group=newG; });
+      quote.lines.forEach(l=>{ if((l.group||"其他元件")===oldG) l.group=newG; });
       if(activeGroup===oldG) activeGroup=newG;
       save(); render();
     });
     c.querySelectorAll("[data-move]").forEach(el=>el.onchange=()=>{ quote.lines[+el.dataset.move].group=el.value; save(); render(); });
+    // 快速加成本元件 → 跳到找產品並篩好該類元件
+    c.querySelectorAll("[data-quick]").forEach(el=>el.onclick=()=>{ briefOn=false; f={kw:el.dataset.quick,type:"元件",onlyActive:true}; view="search"; render(); toast("挑一個元件按「加入規劃」，會加到目前方案"); });
     const csv=document.getElementById("q_csv"); if(csv) csv.onclick=exportCSV;
     const clr=document.getElementById("q_clear"); if(clr) clr.onclick=()=>{ if(confirm("確定清空報價單？")){ quote=newQuote(); save(); render(); } };
     const qs=document.getElementById("q_save"); if(qs) qs.onclick=saveQuote;
@@ -564,7 +577,7 @@
     const t=totals();
     let rows=[["行程段","項目","類型","數量","單位","單價","小計"]];
     groupsOf().forEach(g=>{
-      const items=quote.lines.filter(l=>(l.group||"共用元件")===g);
+      const items=quote.lines.filter(l=>(l.group||"其他元件")===g);
       items.forEach(l=>rows.push([g,l.name,l.type,l.qty,l.unit,l.unitPrice,(Number(l.qty)||0)*(Number(l.unitPrice)||0)]));
       rows.push([g+" 小計","","","","","",items.reduce((s,l)=>s+(Number(l.qty)||0)*(Number(l.unitPrice)||0),0)]);
     });

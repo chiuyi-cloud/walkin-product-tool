@@ -92,7 +92,7 @@ def _group_lines(q):
     """依行程段把項目分組，保留出現順序。回傳 [(段名, [項目...])]"""
     order, m = [], {}
     for l in q.get("lines", []):
-        g = l.get("group") or "共用元件"
+        g = l.get("group") or "其他元件"
         if g not in m:
             m[g] = []; order.append(g)
         m[g].append(l)
