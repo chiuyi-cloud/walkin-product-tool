@@ -18,6 +18,16 @@
   let pf = { kw:"", city:"", duration:"", head:"", purpose:"" };
 
   const PURPOSES = ["員工旅遊","家庭日","Team Building","ESG／志工","文化學習","休閒放鬆","DEI 工作坊","講座／工作坊","外賓接待"];
+  const DURATIONS = ["半日","一日","二日","三日"];
+  // 縣市 → 產品資料的地區群組（產品地區只分這 4 群）
+  const CITY_GROUP = {
+    "台北市":"北/基/宜","新北市":"北/基/宜","基隆市":"北/基/宜","宜蘭縣":"北/基/宜",
+    "桃園市":"桃/竹/苗/中","新竹縣市":"桃/竹/苗/中","苗栗縣":"桃/竹/苗/中","台中市":"桃/竹/苗/中",
+    "彰化縣":"彰/雲/嘉/南","雲林縣":"彰/雲/嘉/南","嘉義縣市":"彰/雲/嘉/南","台南市":"彰/雲/嘉/南",
+    "南投縣":"南投",
+  };
+  const CITIES = Object.keys(CITY_GROUP);
+  let activeGroup = ""; // 新加入的元件預設歸到哪個行程段
 
   function load(){
     try{ const q=JSON.parse(localStorage.getItem(LS)); return q? Object.assign(newQuote(), q) : newQuote(); }
@@ -83,14 +93,14 @@
   // ---------- 找產品（依需求篩選）----------
   function applyFilters(){
     const kw=f.kw.trim().toLowerCase();
-    const bAreas=(quote.areas||[]);
+    const bGroups=[...new Set((quote.areas||[]).map(c=>CITY_GROUP[c]).filter(Boolean))];
     const h=parseInt(quote.headcount)||0;
     return ALL.filter(p=>{
       if(f.onlyActive && !p.active) return false;
       if(f.type && p.type!==f.type) return false;
       // 依客戶需求篩選（只套用在主行程；元件是成本積木不分地區）
       if(briefOn && p.type==="產品"){
-        if(bAreas.length && !(p.area||[]).some(a=>bAreas.includes(a))) return false;
+        if(bGroups.length && !(p.area||[]).some(a=>bGroups.includes(a))) return false;
         if(h && !fitsHeadcount(p,h)) return false;
       }
       if(kw){
@@ -185,9 +195,9 @@
 
   // ---------- 客戶需求 ----------
   function renderBrief(){
-    const areaChips=AREAS.map(a=>`<button class="chip ${(quote.areas||[]).includes(a)?"on":""}" data-area="${esc(a)}">${esc(a)}</button>`).join("");
+    const areaChips=CITIES.map(a=>`<button class="chip ${(quote.areas||[]).includes(a)?"on":""}" data-area="${esc(a)}">${esc(a)}</button>`).join("");
     const purpChips=PURPOSES.map(p=>`<button class="chip ${(quote.purposes||[]).includes(p)?"on":""}" data-purpose="${esc(p)}">${esc(p)}</button>`).join("");
-    const durChips=["半日","一日","多日"].map(d=>`<button class="chip ${quote.duration===d?"on":""}" data-dur="${esc(d)}">${esc(d)}</button>`).join("");
+    const durChips=DURATIONS.map(d=>`<button class="chip ${quote.duration===d?"on":""}" data-dur="${esc(d)}">${esc(d)}</button>`).join("");
     return `<div class="hint info">📝 第一步：先記下這次客戶的需求。填完按「依需求找產品」，系統會幫你篩出合適行程，並列出相似的過去提案參考。</div>
     <div class="card" style="padding:22px;max-width:780px">
       <div class="row2">
@@ -233,12 +243,19 @@
         else qty = 1;                                       // 不確定 → 先 1，業務再調
       }
     }
+    // 行程分段：加入「主行程」會開一個新行程段；加入「元件」歸到目前作用中的行程段
+    let group;
+    if(p.type==="產品"){ group = shortName(p.name); activeGroup = group; }
+    else { group = activeGroup || "共用元件"; }
     quote.lines.push({
       id:p.id, name:p.name, type:p.type, unit:p.unit||"項",
-      qty, unitPrice, priceRange:p.priceRange||""
+      qty, unitPrice, priceRange:p.priceRange||"", group
     });
-    save(); toast("已加入報價："+p.name);
+    save(); toast("已加入："+p.name+"（行程段："+group+"）");
   }
+  function shortName(name){ return String(name).split(/[｜|]/)[0].slice(0,18) || name.slice(0,18); }
+  // 依插入順序取得行程段清單
+  function groupsOf(){ const seen=[]; quote.lines.forEach(l=>{ const g=l.group||"共用元件"; if(!seen.includes(g)) seen.push(g); }); return seen; }
 
   function totals(){
     const cost = quote.lines.reduce((s,l)=>s + (Number(l.qty)||0)*(Number(l.unitPrice)||0), 0);
@@ -256,22 +273,36 @@
     }
     const t=totals();
     const noPriceCount = quote.lines.filter(l=>!(Number(l.unitPrice)>0)).length;
-    const rows=quote.lines.map((l,i)=>{
+    const groups = groupsOf();
+    const moveOpts = [...new Set([...groups,"共用元件"])];
+    function lineRow(l,i){
       const noPrice = !(Number(l.unitPrice)>0);
       const sub = (Number(l.qty)||0)*(Number(l.unitPrice)||0);
       const nameNote = l.priceRange
         ? `<div style="font-size:11px;color:var(--muted)">參考定價：${esc(l.priceRange)}</div>`
         : (noPrice && l.type==="產品" ? `<div style="font-size:11px;color:var(--danger)">⚠️ Zoho 無定價，請填每人售價</div>` : "");
       return `<tr>
-      <td><span class="pill ${l.type==="產品"?"prod":"comp"}">${l.type==="產品"?"行程":"元件"}</span></td>
-      <td>${esc(l.name)}${nameNote}</td>
-      <td class="num"><input class="qty-inp" type="number" min="0" data-q="${i}" value="${esc(l.qty)}"></td>
-      <td style="color:var(--muted);font-size:12px">${esc(l.unit)}</td>
-      <td class="num"><input class="price-inp" type="number" min="0" data-p="${i}" value="${esc(l.unitPrice)}" style="${noPrice?'border-color:#dc2626;background:#fff7f7':''}"></td>
-      <td class="num"><b>${nf(sub)}</b></td>
-      <td><button class="lineDel" data-del="${i}" title="移除">×</button></td>
-    </tr>`;}).join("");
+        <td><span class="pill ${l.type==="產品"?"prod":"comp"}">${l.type==="產品"?"行程":"元件"}</span></td>
+        <td>${esc(l.name)}${nameNote}</td>
+        <td class="num"><input class="qty-inp" type="number" min="0" data-q="${i}" value="${esc(l.qty)}"></td>
+        <td style="color:var(--muted);font-size:12px">${esc(l.unit)}</td>
+        <td class="num"><input class="price-inp" type="number" min="0" data-p="${i}" value="${esc(l.unitPrice)}" style="${noPrice?'border-color:#dc2626;background:#fff7f7':''}"></td>
+        <td class="num"><b>${nf(sub)}</b></td>
+        <td style="white-space:nowrap"><select class="grp-move" data-move="${i}" title="移到行程段" style="font-size:11px;padding:3px;max-width:90px">${moveOpts.map(o=>`<option ${o===(l.group||"共用元件")?"selected":""}>${esc(o)}</option>`).join("")}</select> <button class="lineDel" data-del="${i}" title="移除">×</button></td>
+      </tr>`;
+    }
+    const body = groups.map(g=>{
+      const items = quote.lines.map((l,i)=>({l,i})).filter(x=>(x.l.group||"共用元件")===g);
+      const gsub = items.reduce((s,x)=>s+(Number(x.l.qty)||0)*(Number(x.l.unitPrice)||0),0);
+      const header = `<tr style="background:#fff7ed">
+        <td style="text-align:center">🧭</td>
+        <td colspan="3"><input class="inp" data-grename="${esc(g)}" value="${esc(g)}" style="font-weight:700;width:100%;padding:5px 8px"></td>
+        <td class="num" style="color:var(--muted);font-size:12px">行程小計</td>
+        <td class="num"><b>${nf(gsub)}</b></td><td></td></tr>`;
+      return header + items.map(x=>lineRow(x.l,x.i)).join("");
+    }).join("");
     const warnBanner = noPriceCount ? `<div class="hint" style="margin:0;border-radius:0;border-left:none;border-right:none">⚠️ 有 <b>${noPriceCount}</b> 個項目尚未填單價（Zoho 無定價），報價尚未完整——請在「單價」欄填入金額。</div>` : "";
+    const dayHint = (quote.duration==="二日"||quote.duration==="三日") ? `<div class="hint" style="margin:0;border-radius:0;border-left:none;border-right:none;background:#eff6ff;border-color:#bfdbfe;color:#1e40af">🗓️ ${esc(quote.duration)}行程：每天各加一個主行程（會各成一個行程段），記得補上<b>住宿</b>與各天的餐食／交通元件。可用每列右側下拉把元件移到對應行程段。</div>` : "";
     return `<div class="qwrap">
       <div class="card" style="overflow:hidden">
         <div style="display:flex;gap:14px;flex-wrap:wrap;padding:14px 16px;border-bottom:1px solid var(--line)">
@@ -280,10 +311,10 @@
           <div class="fg"><label>利潤加成 %</label><input class="inp" id="q_markup" type="number" min="0" style="width:90px" value="${esc(quote.markup)}"></div>
           <div class="fg" style="justify-content:flex-end"><button class="btn ghost sm" id="q_headfill">人數套用到「以人計價」項目</button></div>
         </div>
-        ${warnBanner}
+        ${dayHint}${warnBanner}
         <div style="overflow:auto"><table>
-          <thead><tr><th></th><th>項目</th><th class="num">數量</th><th>單位</th><th class="num">單價</th><th class="num">小計</th><th></th></tr></thead>
-          <tbody>${rows}</tbody>
+          <thead><tr><th></th><th>項目</th><th class="num">數量</th><th>單位</th><th class="num">單價</th><th class="num">小計</th><th>行程段</th></tr></thead>
+          <tbody>${body}</tbody>
         </table></div>
       </div>
       <div>
@@ -335,16 +366,23 @@
         L.push("");
       });
     } else { L.push("（尚未加入主行程，請於產品搜尋加入「行程」類項目）"); L.push(""); }
-    L.push(`## 報價明細`);
+    L.push(`## 報價明細（依行程段）`);
     L.push("");
-    L.push("| 項目 | 數量 | 單位 | 單價 | 小計 |");
-    L.push("|---|---:|---|---:|---:|");
-    quote.lines.forEach(l=>{
-      L.push(`| ${l.name} | ${l.qty} | ${l.unit} | ${nf(l.unitPrice)} | ${nf((Number(l.qty)||0)*(Number(l.unitPrice)||0))} |`);
+    groupsOf().forEach(g=>{
+      const items=quote.lines.filter(l=>(l.group||"共用元件")===g);
+      const gsub=items.reduce((s,l)=>s+(Number(l.qty)||0)*(Number(l.unitPrice)||0),0);
+      L.push(`**${g}**`);
+      L.push("| 項目 | 數量 | 單位 | 單價 | 小計 |");
+      L.push("|---|---:|---|---:|---:|");
+      items.forEach(l=>{
+        L.push(`| ${l.name} | ${l.qty} | ${l.unit} | ${nf(l.unitPrice)} | ${nf((Number(l.qty)||0)*(Number(l.unitPrice)||0))} |`);
+      });
+      L.push(`| 行程段小計 | | | | ${nf(gsub)} |`);
+      L.push("");
     });
-    L.push(`| **成本合計** | | | | **${nf(t.cost)}** |`);
-    L.push(`| **建議售價（含 ${t.m}% 加成）** | | | | **${nf(t.price)}** |`);
-    L.push(`| **每人單價** | | | | **${nf(Math.round(t.pricePP))}** |`);
+    L.push(`- **成本合計**：NT$ ${nf(t.cost)}`);
+    L.push(`- **建議售價（含 ${t.m}% 加成）**：NT$ ${nf(t.price)}`);
+    L.push(`- **每人單價**：NT$ ${nf(Math.round(t.pricePP))}`);
     L.push("");
     if(esgSet.size){
       L.push(`## ESG 效益`);
@@ -465,6 +503,15 @@
     c.querySelectorAll("[data-q]").forEach(el=>el.onchange=()=>{ quote.lines[+el.dataset.q].qty=parseFloat(el.value)||0; save(); render(); });
     c.querySelectorAll("[data-p]").forEach(el=>el.onchange=()=>{ quote.lines[+el.dataset.p].unitPrice=parseFloat(el.value)||0; save(); render(); });
     c.querySelectorAll("[data-del]").forEach(el=>el.onclick=()=>{ quote.lines.splice(+el.dataset.del,1); save(); render(); });
+    // 行程段：改名 / 把某列移到別段
+    c.querySelectorAll("[data-grename]").forEach(el=>el.onchange=()=>{
+      const oldG=el.dataset.grename, newG=el.value.trim()||oldG;
+      if(newG===oldG) return;
+      quote.lines.forEach(l=>{ if((l.group||"共用元件")===oldG) l.group=newG; });
+      if(activeGroup===oldG) activeGroup=newG;
+      save(); render();
+    });
+    c.querySelectorAll("[data-move]").forEach(el=>el.onchange=()=>{ quote.lines[+el.dataset.move].group=el.value; save(); render(); });
     const csv=document.getElementById("q_csv"); if(csv) csv.onclick=exportCSV;
     const clr=document.getElementById("q_clear"); if(clr) clr.onclick=()=>{ if(confirm("確定清空報價單？")){ quote=newQuote(); save(); render(); } };
     const qs=document.getElementById("q_save"); if(qs) qs.onclick=saveQuote;
@@ -515,11 +562,15 @@
 
   function exportCSV(){
     const t=totals();
-    let rows=[["項目","類型","數量","單位","單價","小計"]];
-    quote.lines.forEach(l=>rows.push([l.name,l.type,l.qty,l.unit,l.unitPrice,(Number(l.qty)||0)*(Number(l.unitPrice)||0)]));
-    rows.push([]); rows.push(["成本合計","","","","",t.cost]);
-    rows.push([`建議售價(含${t.m}%)`,"","","","",t.price]);
-    rows.push(["每人單價","","","","",Math.round(t.pricePP)]);
+    let rows=[["行程段","項目","類型","數量","單位","單價","小計"]];
+    groupsOf().forEach(g=>{
+      const items=quote.lines.filter(l=>(l.group||"共用元件")===g);
+      items.forEach(l=>rows.push([g,l.name,l.type,l.qty,l.unit,l.unitPrice,(Number(l.qty)||0)*(Number(l.unitPrice)||0)]));
+      rows.push([g+" 小計","","","","","",items.reduce((s,l)=>s+(Number(l.qty)||0)*(Number(l.unitPrice)||0),0)]);
+    });
+    rows.push([]); rows.push(["成本合計","","","","","",t.cost]);
+    rows.push([`建議售價(含${t.m}%)`,"","","","","",t.price]);
+    rows.push(["每人單價","","","","","",Math.round(t.pricePP)]);
     const csv="﻿"+rows.map(r=>r.map(x=>`"${String(x==null?"":x).replace(/"/g,'""')}"`).join(",")).join("\r\n");
     dl(csv, `報價_${quote.customer||"未命名"}.csv`, "text/csv");
     toast("已匯出 CSV");

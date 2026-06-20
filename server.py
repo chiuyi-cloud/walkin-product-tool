@@ -18,7 +18,7 @@
 
 啟動： python3 server.py        （預設 port 4181）
 """
-import base64, hmac, json, os, threading, datetime
+import base64, hmac, json, os, re, threading, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
@@ -88,27 +88,59 @@ def _google_services():
     return _google["svc"]
 
 
-def _quote_rows(q):
-    """把報價內容排成試算表的列。"""
+def _group_lines(q):
+    """依行程段把項目分組，保留出現順序。回傳 [(段名, [項目...])]"""
+    order, m = [], {}
+    for l in q.get("lines", []):
+        g = l.get("group") or "共用元件"
+        if g not in m:
+            m[g] = []; order.append(g)
+        m[g].append(l)
+    return [(g, m[g]) for g in order]
+
+
+def _line_sub(l):
+    return (l.get("qty", 0) or 0) * (l.get("unitPrice", 0) or 0)
+
+
+def _segment_rows(gname, items):
+    """單一行程段的工作表內容：所有元件＋數量＋小計，方便業務看成本結構。"""
+    rows = [[f"行程段：{gname}"], [], ["項目", "數量", "單位", "單價", "小計"]]
+    sub = 0
+    for l in items:
+        st = _line_sub(l); sub += st
+        rows.append([l.get("name", ""), l.get("qty", 0) or 0, l.get("unit", ""), l.get("unitPrice", 0) or 0, st])
+    rows += [[], ["行程段成本小計", "", "", "", sub]]
+    return rows
+
+
+def _summary_rows(q, groups):
+    """總表：客戶、人數、各行程段成本、合計、售價、人均。"""
     rows = [
         [f"報價單　客戶：{q.get('customer','')}"],
         [f"人數：{q.get('headcount','')}", f"利潤加成：{q.get('markup','')}%"],
-        [],
-        ["項目", "數量", "單位", "單價", "小計"],
+        [], ["各行程段成本"],
     ]
-    for l in q.get("lines", []):
-        qty = l.get("qty", 0) or 0
-        up = l.get("unitPrice", 0) or 0
-        rows.append([l.get("name", ""), qty, l.get("unit", ""), up, qty * up])
+    for gname, items in groups:
+        rows.append([gname, "", "", "", sum(_line_sub(l) for l in items)])
     rows += [
         [],
         ["成本合計", "", "", "", q.get("cost", "")],
         [f"建議售價（含 {q.get('markup','')}% 加成）", "", "", "", q.get("price", "")],
         ["每人單價", "", "", "", q.get("pricePP", "")],
-        [],
-        [f"產生時間（UTC）：{_now()}"],
+        [], [f"產生時間（UTC）：{_now()}"],
     ]
     return rows
+
+
+def _safe_title(name, used):
+    """工作表名稱：去除不合法字元、限長、避免重複。"""
+    t = re.sub(r"[:\\/?*\[\]]", " ", str(name)).strip()[:28] or "行程"
+    base, i = t, 2
+    while t in used:
+        t = f"{base[:24]} {i}"; i += 1
+    used.add(t)
+    return t
 
 
 def write_quote_to_gsheet(quote):
@@ -120,16 +152,29 @@ def write_quote_to_gsheet(quote):
     try:
         sheets, drive = _google_services()
         title = f"報價_{quote.get('customer','未命名')}_{_now()}"
-        # 直接在共用資料夾中建立試算表（supportsAllDrives 同時支援共用雲端硬碟）
         f = drive.files().create(
             body={"name": title, "mimeType": "application/vnd.google-apps.spreadsheet", "parents": [folder]},
             fields="id, webViewLink", supportsAllDrives=True,
         ).execute()
         sid = f["id"]
-        sheets.spreadsheets().values().update(
-            spreadsheetId=sid, range="A1", valueInputOption="USER_ENTERED",
-            body={"values": _quote_rows(quote)},
-        ).execute()
+        groups = _group_lines(quote)
+        meta = sheets.spreadsheets().get(spreadsheetId=sid).execute()
+        first_id = meta["sheets"][0]["properties"]["sheetId"]
+        used = set()
+        sum_title = _safe_title("總表", used)
+        # 把預設工作表改名為「總表」，並為每個行程段各加一張工作表
+        reqs = [{"updateSheetProperties": {"properties": {"sheetId": first_id, "title": sum_title}, "fields": "title"}}]
+        segs = []
+        for gname, items in groups:
+            st = _safe_title(gname, used); segs.append((st, gname, items))
+            reqs.append({"addSheet": {"properties": {"title": st}}})
+        sheets.spreadsheets().batchUpdate(spreadsheetId=sid, body={"requests": reqs}).execute()
+        # 寫入各工作表內容
+        data = [{"range": f"'{sum_title}'!A1", "values": _summary_rows(quote, groups)}]
+        for st, gname, items in segs:
+            data.append({"range": f"'{st}'!A1", "values": _segment_rows(gname, items)})
+        sheets.spreadsheets().values().batchUpdate(
+            spreadsheetId=sid, body={"valueInputOption": "USER_ENTERED", "data": data}).execute()
         return {"target": "Google試算表", "ok": True, "url": f.get("webViewLink")}
     except Exception as e:
         import traceback; traceback.print_exc()  # 進 Railway log
