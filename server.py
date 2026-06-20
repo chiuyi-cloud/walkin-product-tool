@@ -220,19 +220,6 @@ class Handler(BaseHTTPRequestHandler):
                 "zoho": bool(os.environ.get("ZOHO_REFRESH_TOKEN")),
                 "indexSheet": bool(os.environ.get("INDEX_SHEET_ID")),
             }})
-        if path == "/api/diag":
-            # 診斷：實際嘗試寫一筆測試報價，回傳完整結果與環境資訊
-            import sys
-            try:
-                from importlib.metadata import version
-                gapi = version("google-api-python-client")
-            except Exception:
-                gapi = "?"
-            result = write_quote_to_gsheet({
-                "customer": "診斷測試", "headcount": 1, "markup": 0,
-                "lines": [{"name": "測試項", "qty": 1, "unit": "項", "unitPrice": 1}],
-                "cost": 1, "price": 1, "pricePP": 1})
-            return self._json({"python": sys.version, "google_api_client": gapi, "result": result})
         return self._static(path)
 
     def do_POST(self):

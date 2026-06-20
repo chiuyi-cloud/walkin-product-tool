@@ -144,15 +144,29 @@
   }
 
   // ---------- 報價試算 ----------
+  // 從定價文字抓第一個價格數字（3 位數以上），如「每人760-1500」→760、「3,200~3,500」→3200
+  function firstPrice(s){ if(!s) return 0; const m=String(s).replace(/[,，]/g,"").match(/\d{3,}/); return m?parseInt(m[0]):0; }
+
   function addLine(id){
     const p=ALL.find(x=>x.id===id); if(!p) return;
     if(quote.lines.find(l=>l.id===id)){ toast("已在報價單中"); return; }
     const perPerson = p.unit==="人";
+    let unitPrice = p.unitPrice!=null ? p.unitPrice : 0;
+    let qty = perPerson ? (quote.headcount||1) : 1;
+    // 主行程：自動帶入定價區間低標當參考單價；數量依計價方式判斷
+    if(p.type==="產品" && !unitPrice){
+      const ref = firstPrice(p.priceRange);
+      if(ref){
+        unitPrice = ref;
+        const pr = p.priceRange || "";
+        if(/場/.test(pr)) qty = 1;                          // 「一場/每場」整團計價
+        else if(/人/.test(pr) || perPerson) qty = quote.headcount||1;  // 每人計價 → ×人數
+        else qty = 1;                                       // 不確定 → 先 1，業務再調
+      }
+    }
     quote.lines.push({
       id:p.id, name:p.name, type:p.type, unit:p.unit||"項",
-      qty: perPerson? (quote.headcount||1) : 1,
-      unitPrice: p.unitPrice!=null? p.unitPrice : 0,
-      priceRange: p.priceRange||""
+      qty, unitPrice, priceRange:p.priceRange||""
     });
     save(); toast("已加入報價："+p.name);
   }
