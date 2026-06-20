@@ -251,14 +251,10 @@
     // 元件用 Zoho 單價；主行程不帶全日價（當作參考售價，成本改由元件組成）
     let unitPrice = p.type==="產品" ? 0 : (p.unitPrice!=null ? p.unitPrice : 0);
     let qty = perPerson ? (quote.headcount||1) : 1;
-    // 方案分段：二日/三日 → 同一個方案（兩天放一起）；半日/一日 → 每個主行程各一個方案（各一張 sheet）
+    // 每個行程各自成一段（元件掛在它底下）；二日/三日時這些段會輸出到同一張報價分頁
     let group;
-    if(p.type==="產品"){
-      group = multiDay ? (activeGroup || (quote.duration+"行程方案")) : shortName(p.name);
-      activeGroup = group;
-    } else {
-      group = activeGroup || "其他元件";
-    }
+    if(p.type==="產品"){ group = shortName(p.name); activeGroup = group; }
+    else { group = activeGroup || "其他元件"; }
     quote.lines.push({
       id:p.id, name:p.name, type:p.type, unit:p.unit||"項",
       qty, unitPrice, priceRange:p.priceRange||"", group
@@ -284,9 +280,10 @@
     push(pickComp("國內一日","保險"), H);
     // 體驗/門票：資料庫無拆解，放一筆提醒（紅色）讓業務填
     quote.lines.push({id:"_exp_"+Math.random().toString(36).slice(2,7), name:"體驗／門票／其他（請填每人成本）", type:"元件", unit:"人", qty:H, unitPrice:0, priceRange:"", group, tpl:true});
-    // 二日/三日：方案內若還沒有住宿，補一筆住宿
-    if(multiDay && !quote.lines.some(l=>(l.group===group)&&/住宿/.test(l.name))){
+    // 二日/三日：整筆若還沒有住宿，補一筆住宿到「共用」段（整趟共用，加一次）
+    if(multiDay && !quote.lines.some(l=>/住宿/.test(l.name))){
       const acc=ALL.find(x=>x.type==="元件"&&x.name.indexOf("住宿")>=0&&x.active);
+      group="共用";
       if(acc) push(acc, H);
     }
   }
@@ -343,7 +340,7 @@
       return header + items.map(x=>lineRow(x.l,x.i)).join("");
     }).join("");
     const warnBanner = noPriceCount ? `<div class="hint" style="margin:0;border-radius:0;border-left:none;border-right:none">⚠️ 有 <b>${noPriceCount}</b> 個元件尚未填單價——請在「單價」欄填入金額。</div>` : "";
-    const dayHint = (quote.duration==="二日"||quote.duration==="三日") ? `<div class="hint" style="margin:0;border-radius:0;border-left:none;border-right:none;background:#eff6ff;border-color:#bfdbfe;color:#1e40af">🗓️ ${esc(quote.duration)}行程＝同一個方案（同一張報價分頁）：兩天的行程都加進來，已自動帶入<b>住宿</b>一列，記得補各天的餐食／交通／導覽元件並填價。</div>` : "";
+    const dayHint = (quote.duration==="二日"||quote.duration==="三日") ? `<div class="hint" style="margin:0;border-radius:0;border-left:none;border-right:none;background:#eff6ff;border-color:#bfdbfe;color:#1e40af">🗓️ ${esc(quote.duration)}行程：<b>每個行程各自一段</b>，元件就掛在它底下（看得出哪個元件屬於哪天）；住宿放「共用」段。這些段會一起輸出到<b>同一張報價分頁</b>。</div>` : "";
     const quickRow = `<div style="padding:9px 16px;border-bottom:1px solid var(--line);display:flex;gap:6px;align-items:center;flex-wrap:wrap;font-size:12.5px">
       <span style="color:var(--muted)">快速加成本元件（看得到單價）：</span>
       ${QUICK_COMP.map(q=>`<button class="btn ghost sm" data-quick="${esc(q.kw)}">＋${esc(q.l)}</button>`).join("")}
@@ -639,7 +636,7 @@
     if(!API_BASE && API_BASE!==""){ toast("此為試用版，回存需用部署版（線上版）"); return; }
     const t=totals();
     const payload={ kind:"quote", customer:quote.customer, headcount:quote.headcount, markup:quote.markup,
-      lines:quote.lines, cost:t.cost, price:t.price, pricePP:Math.round(t.pricePP) };
+      duration:quote.duration, lines:quote.lines, cost:t.cost, price:t.price, pricePP:Math.round(t.pricePP) };
     try{ resultsToast(await postJSON("/api/save-quote", payload)); }
     catch(e){ toast("回存失敗（後端未啟動？）"); }
   }

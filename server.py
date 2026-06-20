@@ -103,15 +103,29 @@ def _line_sub(l):
     return (l.get("qty", 0) or 0) * (l.get("unitPrice", 0) or 0)
 
 
-def _segment_rows(gname, items):
-    """單一行程段的工作表內容：所有元件＋數量＋小計，方便業務看成本結構。"""
-    rows = [[f"行程段：{gname}"], [], ["項目", "數量", "單位", "單價", "小計"]]
-    sub = 0
-    for l in items:
-        st = _line_sub(l); sub += st
-        rows.append([l.get("name", ""), l.get("qty", 0) or 0, l.get("unit", ""), l.get("unitPrice", 0) or 0, st])
-    rows += [[], ["行程段成本小計", "", "", "", sub]]
+def _sheet_rows(sheet_name, seglist):
+    """一張報價分頁：可含多個行程段，每段列出元件＋數量＋小計，最後本頁合計。"""
+    rows = [[f"報價分頁：{sheet_name}"], []]
+    total = 0
+    for seg, items in seglist:
+        rows.append([f"▍行程：{seg}"])
+        rows.append(["項目", "數量", "單位", "單價", "小計"])
+        sub = 0
+        for l in items:
+            st = _line_sub(l); sub += st
+            rows.append([l.get("name", ""), l.get("qty", 0) or 0, l.get("unit", ""), l.get("unitPrice", 0) or 0, st])
+        rows += [["　行程小計", "", "", "", sub], []]
+        total += sub
+    rows.append(["本分頁成本合計", "", "", "", total])
     return rows
+
+
+def _sheets_plan(q, groups):
+    """決定分頁配置：二日/三日 → 所有行程段放同一張分頁；其餘 → 每段一張。"""
+    if q.get("duration") in ("二日", "三日"):
+        name = f"（{q.get('duration')}）行程方案"
+        return [(name, groups)]
+    return [(seg, [(seg, items)]) for seg, items in groups]
 
 
 def _summary_rows(q, groups):
@@ -158,21 +172,22 @@ def write_quote_to_gsheet(quote):
         ).execute()
         sid = f["id"]
         groups = _group_lines(quote)
+        plan = _sheets_plan(quote, groups)   # [(分頁名, [(行程段, items)])]
         meta = sheets.spreadsheets().get(spreadsheetId=sid).execute()
         first_id = meta["sheets"][0]["properties"]["sheetId"]
         used = set()
         sum_title = _safe_title("總表", used)
-        # 把預設工作表改名為「總表」，並為每個行程段各加一張工作表
+        # 把預設工作表改名為「總表」，並為每張報價分頁各加一張工作表
         reqs = [{"updateSheetProperties": {"properties": {"sheetId": first_id, "title": sum_title}, "fields": "title"}}]
-        segs = []
-        for gname, items in groups:
-            st = _safe_title(gname, used); segs.append((st, gname, items))
+        tabs = []
+        for sheet_name, seglist in plan:
+            st = _safe_title(sheet_name, used); tabs.append((st, seglist))
             reqs.append({"addSheet": {"properties": {"title": st}}})
         sheets.spreadsheets().batchUpdate(spreadsheetId=sid, body={"requests": reqs}).execute()
         # 寫入各工作表內容
         data = [{"range": f"'{sum_title}'!A1", "values": _summary_rows(quote, groups)}]
-        for st, gname, items in segs:
-            data.append({"range": f"'{st}'!A1", "values": _segment_rows(gname, items)})
+        for st, seglist in tabs:
+            data.append({"range": f"'{st}'!A1", "values": _sheet_rows(st, seglist)})
         sheets.spreadsheets().values().batchUpdate(
             spreadsheetId=sid, body={"valueInputOption": "USER_ENTERED", "data": data}).execute()
         return {"target": "Google試算表", "ok": True, "url": f.get("webViewLink")}
