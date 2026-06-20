@@ -1,0 +1,16 @@
+# 機密：服務帳號金鑰、環境變數 —— 絕不上傳
+service-account.json
+*.serviceaccount.json
+proposal-price-tool-*.json
+*-*.iam.gserviceaccount.json
+.env
+
+# 執行期產生
+submissions/
+__pycache__/
+*.pyc
+
+# 暫存
+.DS_Store
+_index.xlsx
+產品與報價工具_試用版.zip
