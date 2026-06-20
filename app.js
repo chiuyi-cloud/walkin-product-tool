@@ -249,14 +249,33 @@
       id:p.id, name:p.name, type:p.type, unit:p.unit||"項",
       qty, unitPrice, priceRange:p.priceRange||"", group
     });
-    // 二日/三日：方案內若還沒有住宿，自動補一筆住宿（提醒填價）
-    if(multiDay && p.type==="產品" && !quote.lines.some(l=>(l.group===group)&&/住宿/.test(l.name))){
-      const acc=ALL.find(x=>x.type==="元件"&&x.name.indexOf("住宿")>=0&&x.active);
-      if(acc) quote.lines.push({ id:acc.id, name:acc.name, type:"元件", unit:acc.unit||"人", qty:quote.headcount||1, unitPrice:acc.unitPrice||0, priceRange:"", group });
-    }
-    save(); toast("已加入："+p.name+"（方案："+group+"）");
+    // 加入主行程時：自動帶入一套成本範本（先試算，業務再核對調整）
+    if(p.type==="產品") addCostTemplate(group, multiDay);
+    save(); toast("已加入："+p.name+"（已帶入成本範本，請核對）");
   }
   function shortName(name){ return String(name).split(/[｜|]/)[0].slice(0,18) || name.slice(0,18); }
+
+  // 找一個有單價的代表性元件
+  function pickComp(){ const terms=[].slice.call(arguments);
+    for(const t of terms){ const p=ALL.find(x=>x.type==="元件"&&x.active&&x.name.indexOf(t)>=0&&Number(x.unitPrice)>0); if(p) return p; }
+    return null;
+  }
+  // 一日成本範本：帶路人(每25人1位)、餐食、交通(每43人1台)、保險、體驗(待填) — 依人數試算
+  function addCostTemplate(group, multiDay){
+    const H=quote.headcount||1;
+    const push=(p,qty)=>{ if(p) quote.lines.push({id:p.id,name:p.name,type:"元件",unit:p.unit||"項",qty,unitPrice:p.unitPrice||0,priceRange:"",group}); };
+    push(pickComp("帶路人 4000","帶路人","導覽員 1600","導覽員"), Math.max(1,Math.ceil(H/25)));
+    push(pickComp("便當","司領餐","餐食"), H);
+    push(pickComp("43座大巴","大巴","遊覽車"), Math.max(1,Math.ceil(H/43)));
+    push(pickComp("國內一日","保險"), H);
+    // 體驗/門票：資料庫無拆解，放一筆提醒（紅色）讓業務填
+    quote.lines.push({id:"_exp_"+Math.random().toString(36).slice(2,7), name:"體驗／門票／其他（請填每人成本）", type:"元件", unit:"人", qty:H, unitPrice:0, priceRange:"", group});
+    // 二日/三日：方案內若還沒有住宿，補一筆住宿
+    if(multiDay && !quote.lines.some(l=>(l.group===group)&&/住宿/.test(l.name))){
+      const acc=ALL.find(x=>x.type==="元件"&&x.name.indexOf("住宿")>=0&&x.active);
+      if(acc) push(acc, H);
+    }
+  }
   // 快速加入常用成本元件（跳到找產品並篩好）
   const QUICK_COMP=[{l:"住宿",kw:"住宿"},{l:"餐食",kw:"餐"},{l:"交通",kw:"交通"},{l:"保險",kw:"保險"},{l:"導覽",kw:"導覽員"},{l:"帶路人",kw:"帶路人"}];
   // 依插入順序取得行程段清單
@@ -342,7 +361,7 @@
             <button class="btn ghost sm" id="q_clear">清空</button>
           </div>
         </div>
-        <div class="hint" style="margin-top:14px">💡 主行程的「參考售價」只是過去成交價參考，<b>不列入成本</b>。實際成本請用上方「快速加成本元件」把導覽、餐食、交通、保險、住宿等加進來，每個元件都看得到單價，方便你掌握成本結構並自行調整。</div>
+        <div class="hint" style="margin-top:14px">💡 加入行程時已<b>自動帶入一套成本範本</b>（帶路人、餐食、交通、保險＋體驗待填）並依人數試算，這是<b>估算起點、不是真實成本</b>——請逐項核對單價/數量、補上「體驗／門票」每人成本。主行程的「參考售價」只是過去成交價，不列入成本。核對合理後再「存報價」輸出。</div>
       </div>
     </div>`;
   }
