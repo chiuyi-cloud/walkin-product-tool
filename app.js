@@ -29,6 +29,15 @@
   const CITIES = Object.keys(CITY_GROUP);
   let activeGroup = ""; // 新加入的元件預設歸到哪個行程段
 
+  // 行程↔常用元件對照表（每條主行程的成本範本）
+  const TPL_LS = "walkin_tour_templates_v1";
+  function loadTpls(){ try{ return JSON.parse(localStorage.getItem(TPL_LS))||{}; }catch(e){ return {}; } }
+  let TEMPLATES = loadTpls();
+  function saveTpls(){ localStorage.setItem(TPL_LS, JSON.stringify(TEMPLATES)); }
+  let tplTour="", tplKw="";
+  const QTY_MODES=[{v:"perPerson",l:"每人×人數"},{v:"perGuide",l:"每25人1位"},{v:"perBus",l:"每43人1台"},{v:"fixed",l:"固定數量"}];
+  function calcQty(mode,n,H){ if(mode==="perPerson")return H; if(mode==="perGuide")return Math.max(1,Math.ceil(H/25)); if(mode==="perBus")return Math.max(1,Math.ceil(H/43)); return Number(n)||1; }
+
   function load(){
     try{ const q=JSON.parse(localStorage.getItem(LS)); return q? Object.assign(newQuote(), q) : newQuote(); }
     catch(e){ return newQuote(); }
@@ -82,6 +91,7 @@
       quote:["③ 報價試算","把選好的行程與元件算出成本、售價與每人單價"],
       proposal:["④ 提案產生","依選定行程與報價，產出提案草稿"],
       past:["過去提案參考","291 筆歷史提案，依需求找最接近的舊案參考"],
+      template:["行程成本範本","設定每條主行程實際包含的成本元件，讓報價試算更精準"],
     };
     const t=titles[view]||titles.brief;
     document.getElementById("pageTitle").textContent=t[0];
@@ -92,6 +102,7 @@
     else if(view==="quote") c.innerHTML=renderQuote();
     else if(view==="proposal") c.innerHTML=renderProposal();
     else if(view==="past") c.innerHTML=renderPast();
+    else if(view==="template") c.innerHTML=renderTemplate();
     bind();
   }
 
@@ -259,8 +270,8 @@
       id:p.id, name:p.name, type:p.type, unit:p.unit||"項",
       qty, unitPrice, priceRange:p.priceRange||"", group
     });
-    // 加入主行程時：自動帶入一套成本範本（先試算，業務再核對調整）
-    if(p.type==="產品") addCostTemplate(group, multiDay);
+    // 加入主行程時：自動帶入成本範本（有設定專屬範本就用它，否則用通用範本）
+    if(p.type==="產品") addCostTemplate(p, group, multiDay);
     save(); toast("已加入："+p.name+"（已帶入成本範本，請核對）");
   }
   function shortName(name){ return String(name).split(/[｜|]/)[0].slice(0,18) || name.slice(0,18); }
@@ -270,21 +281,24 @@
     for(const t of terms){ const p=ALL.find(x=>x.type==="元件"&&x.active&&x.name.indexOf(t)>=0&&Number(x.unitPrice)>0); if(p) return p; }
     return null;
   }
-  // 一日成本範本：帶路人(每25人1位)、餐食、交通(每43人1台)、保險、體驗(待填) — 依人數試算
-  function addCostTemplate(group, multiDay){
+  // 成本範本：有設定該行程的專屬範本就用它，否則用通用範本 — 皆依人數試算
+  function addCostTemplate(tour, group, multiDay){
     const H=quote.headcount||1;
-    const push=(p,qty)=>{ if(p) quote.lines.push({id:p.id,name:p.name,type:"元件",unit:p.unit||"項",qty,unitPrice:p.unitPrice||0,priceRange:"",group,tpl:true}); };
-    push(pickComp("帶路人 4000","帶路人","導覽員 1600","導覽員"), Math.max(1,Math.ceil(H/25)));
-    push(pickComp("便當","司領餐","餐食"), H);
-    push(pickComp("43座大巴","大巴","遊覽車"), Math.max(1,Math.ceil(H/43)));
-    push(pickComp("國內一日","保險"), H);
-    // 體驗/門票：資料庫無拆解，放一筆提醒（紅色）讓業務填
-    quote.lines.push({id:"_exp_"+Math.random().toString(36).slice(2,7), name:"體驗／門票／其他（請填每人成本）", type:"元件", unit:"人", qty:H, unitPrice:0, priceRange:"", group, tpl:true});
+    const add=(o)=>quote.lines.push(Object.assign({type:"元件",priceRange:"",tpl:true}, o));
+    const saved=TEMPLATES[tour.id];
+    if(saved && saved.items && saved.items.length){
+      saved.items.forEach(it=>add({id:it.id,name:it.name,unit:it.unit||"項",unitPrice:it.unitPrice||0,qty:calcQty(it.mode,it.n,H),group}));
+    } else {
+      const g=pickComp("帶路人 4000","帶路人","導覽員 1600","導覽員"); if(g) add({id:g.id,name:g.name,unit:g.unit||"項",unitPrice:g.unitPrice||0,qty:Math.max(1,Math.ceil(H/25)),group});
+      const me=pickComp("便當","司領餐","餐食"); if(me) add({id:me.id,name:me.name,unit:me.unit||"人",unitPrice:me.unitPrice||0,qty:H,group});
+      const bs=pickComp("43座大巴","大巴","遊覽車"); if(bs) add({id:bs.id,name:bs.name,unit:bs.unit||"項",unitPrice:bs.unitPrice||0,qty:Math.max(1,Math.ceil(H/43)),group});
+      const ins=pickComp("國內一日","保險"); if(ins) add({id:ins.id,name:ins.name,unit:ins.unit||"人",unitPrice:ins.unitPrice||0,qty:H,group});
+      add({id:"_exp_"+Math.random().toString(36).slice(2,7),name:"體驗／門票／其他（請填每人成本）",unit:"人",unitPrice:0,qty:H,group});
+    }
     // 二日/三日：整筆若還沒有住宿，補一筆住宿到「共用」段（整趟共用，加一次）
     if(multiDay && !quote.lines.some(l=>/住宿/.test(l.name))){
       const acc=ALL.find(x=>x.type==="元件"&&x.name.indexOf("住宿")>=0&&x.active);
-      group="共用";
-      if(acc) push(acc, H);
+      if(acc) add({id:acc.id,name:acc.name,unit:acc.unit||"人",unitPrice:acc.unitPrice||0,qty:H,group:"共用"});
     }
   }
   // 快速加入常用成本元件（跳到找產品並篩好）
@@ -395,25 +409,24 @@
     L.push(`- 每人建議單價：NT$ ${nf(Math.round(t.pricePP))}（總計 NT$ ${nf(t.price)}）`);
     if(topicSet.size) L.push(`- 活動主題：${[...topicSet].join("、")}`);
     L.push("");
-    L.push(`## 推薦行程`);
-    if(prods.length){
-      prods.forEach(l=>{
-        const p=ALL.find(x=>x.id===l.id)||{};
-        L.push(`### ${l.name}`);
-        if(p.area&&p.area.length) L.push(`- 地區：${p.area.join("、")}`);
-        if(p.capacity) L.push(`- 建議人數：${p.capacity}`);
-        if(p.priceRange) L.push(`- 定價參考：${p.priceRange}`);
-        if(p.topics&&p.topics.length) L.push(`- 亮點：${p.topics.join("、")}`);
-        if(p.url) L.push(`- 詳細介紹：${p.url}`);
-        L.push("");
-      });
-    } else { L.push("（尚未加入主行程，請於產品搜尋加入「行程」類項目）"); L.push(""); }
-    L.push(`## 報價明細（依行程段）`);
+    L.push(`## 行程安排與費用（依行程段）`);
     L.push("");
-    groupsOf().forEach(g=>{
+    const segs=groupsOf();
+    if(!segs.length){ L.push("（尚未加入行程，請於「找產品」加入行程與元件）"); L.push(""); }
+    segs.forEach(g=>{
       const items=quote.lines.filter(l=>(l.group||"其他元件")===g);
       const gsub=items.reduce((s,l)=>s+(Number(l.qty)||0)*(Number(l.unitPrice)||0),0);
-      L.push(`**${g}**`);
+      L.push(`### ${g}`);
+      // 該行程段的主行程介紹
+      items.filter(l=>l.type==="產品").forEach(l=>{
+        const p=ALL.find(x=>x.id===l.id)||{};
+        L.push(`**${l.name}**`);
+        if(p.area&&p.area.length) L.push(`- 地區：${p.area.join("、")}`);
+        if(p.topics&&p.topics.length) L.push(`- 亮點：${p.topics.join("、")}`);
+        if(p.url) L.push(`- 詳細介紹：${p.url}`);
+      });
+      // 該行程段的費用明細
+      L.push("");
       L.push("| 項目 | 數量 | 單位 | 單價 | 小計 |");
       L.push("|---|---:|---|---:|---:|");
       items.forEach(l=>{
@@ -490,6 +503,44 @@
         ${p.link?`<a class="btn sm" href="${esc(p.link)}" target="_blank" rel="noopener" style="text-decoration:none">開啟提案 ↗</a>`:`<span style="font-size:12px;color:var(--muted)">無連結</span>`}
       </div>
     </div>`;
+  }
+
+  // ---------- 行程成本範本（行程↔元件對照表）----------
+  function tplPickList(){
+    const kw=tplKw.trim().toLowerCase();
+    const matches = kw ? ALL.filter(p=>p.type==="元件"&&p.active&&[p.name,p.category].join(" ").toLowerCase().includes(kw)).slice(0,24) : [];
+    return matches.map(m=>`<button class="btn ghost sm" data-tpladd="${esc(m.id)}">＋ ${esc(m.name)}（${m.unitPrice!=null?nf(m.unitPrice):"無價"}）</button>`).join(" ") || (kw?"<span style='color:var(--muted);font-size:12.5px'>找不到符合的元件</span>":"<span style='color:var(--muted);font-size:12.5px'>輸入關鍵字找元件加入</span>");
+  }
+  function renderTemplate(){
+    const prods=ALL.filter(p=>p.type==="產品"&&p.active).sort((a,b)=>a.name.localeCompare(b.name,"zh-Hant"));
+    const opts=prods.map(p=>`<option value="${esc(p.id)}" ${p.id===tplTour?"selected":""}>${esc(p.name)}${TEMPLATES[p.id]&&TEMPLATES[p.id].items&&TEMPLATES[p.id].items.length?"　✓已設定":""}</option>`).join("");
+    let body="";
+    if(tplTour){
+      const tour=ALL.find(p=>p.id===tplTour)||{};
+      const tpl=TEMPLATES[tplTour]||{items:[]};
+      const items=tpl.items||[];
+      const rows=items.map((it,i)=>`<tr>
+        <td>${esc(it.name)}</td>
+        <td><select data-tplmode="${i}" style="font-size:12px;padding:4px">${QTY_MODES.map(m=>`<option value="${m.v}" ${it.mode===m.v?"selected":""}>${m.l}</option>`).join("")}</select>
+          <input class="qty-inp" data-tpln="${i}" value="${esc(it.n||1)}" style="width:60px;${it.mode==="fixed"?"":"display:none"}"></td>
+        <td class="num"><input class="price-inp" data-tplprice="${i}" value="${esc(it.unitPrice)}"></td>
+        <td><button class="lineDel" data-tpldel="${i}" title="移除">×</button></td>
+      </tr>`).join("");
+      body=`<div class="card" style="padding:18px;margin-top:14px">
+        <h3 style="margin:0 0 4px">${esc(tour.name)}</h3>
+        <div style="font-size:12.5px;color:var(--muted);margin-bottom:12px">設定此行程實際包含的成本元件與數量規則。之後在報價加入這條行程，就會帶入這份成本（取代通用範本）。</div>
+        ${items.length?`<div style="overflow:auto"><table>
+          <thead><tr><th>元件</th><th>數量規則</th><th class="num">單價(成本)</th><th></th></tr></thead>
+          <tbody>${rows}</tbody></table></div>`:`<div style="color:var(--muted);font-size:13px;padding:8px 0">尚未加入元件。用下方關鍵字搜尋元件加入。</div>`}
+        <div style="margin-top:16px;border-top:1px solid var(--line);padding-top:14px">
+          <label class="bfld" style="max-width:420px"><span>加入元件（關鍵字）</span><input class="inp" id="tpl_kw" value="${esc(tplKw)}" placeholder="例：導覽員、便當、43座大巴、保險、住宿"></label>
+          <div class="chips" id="tplPickList">${tplPickList()}</div>
+        </div>
+      </div>`;
+    }
+    return `<div class="hint info">📐 為每條主行程設定它「實際包含哪些成本元件、各多少」。設定後，報價加入這條行程時就帶入<b>它專屬的成本</b>（不再用通用範本），試算更準。建議先設你們最常賣的幾條。</div>
+      <label class="bfld" style="max-width:560px"><span>選擇要設定的主行程</span><select class="inp" id="tpl_tour"><option value="">— 請選擇主行程 —</option>${opts}</select></label>
+      ${body}`;
   }
 
   function renderPast(){
@@ -573,6 +624,29 @@
       const bp=(id,key)=>{ const el=document.getElementById(id); if(el) el.onchange=()=>{ pf[key]=el.value; rerenderProposals(); }; };
       bp("pf_city","city"); bp("pf_duration","duration"); bp("pf_head","head"); bp("pf_purpose","purpose");
       document.getElementById("pf_clear").onclick=()=>{ pf={kw:"",city:"",duration:"",head:"",purpose:""}; render(); };
+    }
+
+    // 行程成本範本
+    const tt=document.getElementById("tpl_tour"); if(tt) tt.onchange=()=>{ tplTour=tt.value; tplKw=""; render(); };
+    const tkw=document.getElementById("tpl_kw");
+    if(tkw){
+      let tm; tkw.oninput=()=>{ clearTimeout(tm); tm=setTimeout(()=>{ tplKw=tkw.value; const pl=document.getElementById("tplPickList"); if(pl){ pl.innerHTML=tplPickList(); bindTplAdd(); } },200); };
+    }
+    bindTplAdd();
+    function ensureTpl(){ if(!TEMPLATES[tplTour]) TEMPLATES[tplTour]={name:(ALL.find(p=>p.id===tplTour)||{}).name||"",items:[]}; return TEMPLATES[tplTour]; }
+    c.querySelectorAll("[data-tplmode]").forEach(el=>el.onchange=()=>{ TEMPLATES[tplTour].items[+el.dataset.tplmode].mode=el.value; saveTpls(); render(); });
+    c.querySelectorAll("[data-tpln]").forEach(el=>el.onchange=()=>{ TEMPLATES[tplTour].items[+el.dataset.tpln].n=parseFloat(el.value)||1; saveTpls(); });
+    c.querySelectorAll("[data-tplprice]").forEach(el=>el.onchange=()=>{ TEMPLATES[tplTour].items[+el.dataset.tplprice].unitPrice=parseFloat(el.value)||0; saveTpls(); });
+    c.querySelectorAll("[data-tpldel]").forEach(el=>el.onclick=()=>{ TEMPLATES[tplTour].items.splice(+el.dataset.tpldel,1); saveTpls(); render(); });
+    function bindTplAdd(){
+      document.querySelectorAll("[data-tpladd]").forEach(el=>el.onclick=()=>{
+        const m=ALL.find(x=>x.id===el.dataset.tpladd); if(!m) return;
+        const t=ensureTpl();
+        if(t.items.some(it=>it.id===m.id)){ toast("已在範本中"); return; }
+        const mode=/帶路人|導覽員|人力/.test(m.name)?"perGuide":(/大巴|中巴|遊覽車|巴士/.test(m.name)?"perBus":((/保險|便當|餐|門票|體驗/.test(m.name)||m.unit==="人")?"perPerson":"fixed"));
+        t.items.push({id:m.id,name:m.name,unit:m.unit||"項",unitPrice:m.unitPrice||0,mode,n:1});
+        saveTpls(); render(); toast("已加入範本："+m.name);
+      });
     }
   }
 
