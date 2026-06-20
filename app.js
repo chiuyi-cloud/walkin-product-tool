@@ -277,13 +277,13 @@
   // 一日成本範本：帶路人(每25人1位)、餐食、交通(每43人1台)、保險、體驗(待填) — 依人數試算
   function addCostTemplate(group, multiDay){
     const H=quote.headcount||1;
-    const push=(p,qty)=>{ if(p) quote.lines.push({id:p.id,name:p.name,type:"元件",unit:p.unit||"項",qty,unitPrice:p.unitPrice||0,priceRange:"",group}); };
+    const push=(p,qty)=>{ if(p) quote.lines.push({id:p.id,name:p.name,type:"元件",unit:p.unit||"項",qty,unitPrice:p.unitPrice||0,priceRange:"",group,tpl:true}); };
     push(pickComp("帶路人 4000","帶路人","導覽員 1600","導覽員"), Math.max(1,Math.ceil(H/25)));
     push(pickComp("便當","司領餐","餐食"), H);
     push(pickComp("43座大巴","大巴","遊覽車"), Math.max(1,Math.ceil(H/43)));
     push(pickComp("國內一日","保險"), H);
     // 體驗/門票：資料庫無拆解，放一筆提醒（紅色）讓業務填
-    quote.lines.push({id:"_exp_"+Math.random().toString(36).slice(2,7), name:"體驗／門票／其他（請填每人成本）", type:"元件", unit:"人", qty:H, unitPrice:0, priceRange:"", group});
+    quote.lines.push({id:"_exp_"+Math.random().toString(36).slice(2,7), name:"體驗／門票／其他（請填每人成本）", type:"元件", unit:"人", qty:H, unitPrice:0, priceRange:"", group, tpl:true});
     // 二日/三日：方案內若還沒有住宿，補一筆住宿
     if(multiDay && !quote.lines.some(l=>(l.group===group)&&/住宿/.test(l.name))){
       const acc=ALL.find(x=>x.type==="元件"&&x.name.indexOf("住宿")>=0&&x.active);
@@ -318,12 +318,13 @@
       const isProd = l.type==="產品";
       const noPrice = !isProd && !(Number(l.unitPrice)>0);   // 元件缺價才標紅
       const sub = (Number(l.qty)||0)*(Number(l.unitPrice)||0);
+      const tplTag = l.tpl ? ` <span class="tag" style="background:#fef3c7;color:#92400e">範本估算·請核對</span>` : "";
       const nameNote = isProd
         ? `<div style="font-size:11px;color:var(--muted)">參考售價：${l.priceRange?esc(l.priceRange):"未定"}（成本請用下方元件組成，不列入成本）</div>`
-        : (noPrice ? `<div style="font-size:11px;color:var(--danger)">⚠️ 請填單價</div>` : "");
+        : (noPrice ? `<div style="font-size:11px;color:var(--danger)">⚠️ 請填單價</div>` : (l.tpl?`<div style="font-size:11px;color:#92400e">範本預設值，請確認是否符合本案（地區/等級可能不同）</div>`:""));
       return `<tr>
         <td><span class="pill ${isProd?"prod":"comp"}">${isProd?"行程":"元件"}</span></td>
-        <td>${esc(l.name)}${nameNote}</td>
+        <td>${esc(l.name)}${tplTag}${nameNote}</td>
         <td class="num"><input class="qty-inp" type="number" min="0" data-q="${i}" value="${esc(l.qty)}"></td>
         <td style="color:var(--muted);font-size:12px">${esc(l.unit)}</td>
         <td class="num"><input class="price-inp" type="number" min="0" data-p="${i}" value="${esc(l.unitPrice)}" style="${noPrice?'border-color:#dc2626;background:#fff7f7':''}"></td>
@@ -545,8 +546,8 @@
     const hf=document.getElementById("q_headfill"); if(hf) hf.onclick=()=>{
       quote.lines.forEach(l=>{ if(l.unit==="人") l.qty=quote.headcount; }); save(); render(); toast("已套用人數");
     };
-    c.querySelectorAll("[data-q]").forEach(el=>el.onchange=()=>{ quote.lines[+el.dataset.q].qty=parseFloat(el.value)||0; save(); render(); });
-    c.querySelectorAll("[data-p]").forEach(el=>el.onchange=()=>{ quote.lines[+el.dataset.p].unitPrice=parseFloat(el.value)||0; save(); render(); });
+    c.querySelectorAll("[data-q]").forEach(el=>el.onchange=()=>{ const l=quote.lines[+el.dataset.q]; l.qty=parseFloat(el.value)||0; l.tpl=false; save(); render(); });
+    c.querySelectorAll("[data-p]").forEach(el=>el.onchange=()=>{ const l=quote.lines[+el.dataset.p]; l.unitPrice=parseFloat(el.value)||0; l.tpl=false; save(); render(); });
     c.querySelectorAll("[data-del]").forEach(el=>el.onclick=()=>{ quote.lines.splice(+el.dataset.del,1); save(); render(); });
     // 行程段：改名 / 把某列移到別段
     c.querySelectorAll("[data-grename]").forEach(el=>el.onchange=()=>{
