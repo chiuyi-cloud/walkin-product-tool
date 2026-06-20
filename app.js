@@ -13,7 +13,7 @@
   let quote = load();
   let briefOn = true; // 「找產品」時是否依客戶需求自動篩選
   // 手動細篩（在需求結果中再搜尋）。預設只看主行程，元件可用下拉切換。
-  let f = { kw:"", type:"產品", onlyActive:true };
+  let f = { kw:"", type:"產品", cat:"", onlyActive:true };
   // 過去提案搜尋條件
   let pf = { kw:"", city:"", duration:"", head:"", purpose:"" };
 
@@ -58,6 +58,11 @@
   // ---------- distinct 選項 ----------
   const CATS = [...new Set(ALL.map(p=>p.category))].sort();
   const AREAS = [...new Set(ALL.flatMap(p=>p.area))].filter(Boolean).sort();
+  // 元件分類（含數量），讓業務從分類找成本元件
+  const ELEM_CATS = (function(){
+    const m={}; ALL.forEach(p=>{ if(p.type==="元件") m[p.category]=(m[p.category]||0)+1; });
+    return Object.keys(m).map(c=>({cat:c, n:m[c]})).sort((a,b)=>b.n-a.n);
+  })();
 
   // ---------- 路由 ----------
   document.getElementById("nav").addEventListener("click", e=>{
@@ -98,6 +103,7 @@
     return ALL.filter(p=>{
       if(f.onlyActive && !p.active) return false;
       if(f.type && p.type!==f.type) return false;
+      if(f.cat && p.category!==f.cat) return false;   // 元件分類
       // 依客戶需求篩選（只套用在主行程；元件是成本積木不分地區）
       if(briefOn && p.type==="產品"){
         if(bGroups.length && !(p.area||[]).some(a=>bGroups.includes(a))) return false;
@@ -185,15 +191,23 @@
       </div>` : "";
     const filters=`<div class="filters">
       <div class="fg" style="flex:1"><label>在結果中再搜尋（關鍵字）</label>
-        <input class="inp search-inp" id="f_kw" value="${esc(f.kw)}" placeholder="例：淨灘、大稻埕、印花樂、藍色公路"></div>
+        <input class="inp search-inp" id="f_kw" value="${esc(f.kw)}" placeholder="例：導覽員、便當、大巴、保險、住宿"></div>
       <div class="fg"><label>類型</label><select id="f_type"><option value="">全部</option><option value="產品" ${f.type==="產品"?"selected":""}>主行程</option><option value="元件" ${f.type==="元件"?"selected":""}>成本元件</option></select></div>
       <button class="btn ghost sm" id="f_clear">清除</button>
     </div>`;
+    // 成本元件：依分類找成本
+    const elemCatBar = f.type==="元件" ? `<div style="margin:2px 0 14px">
+        <div style="font-size:12.5px;color:var(--muted);margin-bottom:6px">依分類找成本元件：</div>
+        <div class="chips">
+          <button class="chip ${!f.cat?"on":""}" data-elemcat="">全部</button>
+          ${ELEM_CATS.map(c=>`<button class="chip ${f.cat===c.cat?"on":""}" data-elemcat="${esc(c.cat)}">${esc(c.cat.replace("元件-","").replace("元件","其他"))}（${c.n}）</button>`).join("")}
+        </div></div>` : "";
     const cards = list.slice(0,300).map(productCard).join("");
-    return propPanel + filters +
-      `<div style="font-weight:800;font-size:14px;margin:6px 0 8px">符合需求的產品</div>
+    const heading = f.type==="元件" ? "成本元件（單價＝成本）" : "符合需求的產品";
+    return propPanel + filters + elemCatBar +
+      `<div style="font-weight:800;font-size:14px;margin:6px 0 8px">${heading}</div>
       <div class="count">符合條件：<b>${list.length}</b> 項${list.length>300?"（僅顯示前 300）":""}</div>
-      <div class="pgrid" id="prodgrid">${cards||'<div class="empty">沒有符合條件的產品（可放寬需求或關掉「依需求篩選」）</div>'}</div>`;
+      <div class="pgrid" id="prodgrid">${cards||'<div class="empty">沒有符合條件的項目（可放寬需求或關掉「依需求篩選」）</div>'}</div>`;
   }
 
   // ---------- 客戶需求 ----------
@@ -518,9 +532,10 @@
     const kw=document.getElementById("f_kw");
     if(kw){
       let tmr; kw.oninput=()=>{ clearTimeout(tmr); tmr=setTimeout(()=>{ f.kw=kw.value; rerenderSearch(); },200); };
-      const ft=document.getElementById("f_type"); if(ft) ft.onchange=()=>{ f.type=ft.value; rerenderSearch(); };
-      const fclr=document.getElementById("f_clear"); if(fclr) fclr.onclick=()=>{ f={kw:"",type:"產品",onlyActive:true}; render(); };
+      const ft=document.getElementById("f_type"); if(ft) ft.onchange=()=>{ f.type=ft.value; f.cat=""; render(); };
+      const fclr=document.getElementById("f_clear"); if(fclr) fclr.onclick=()=>{ f={kw:"",type:"產品",cat:"",onlyActive:true}; render(); };
     }
+    c.querySelectorAll("[data-elemcat]").forEach(el=>el.onclick=()=>{ f.cat=el.dataset.elemcat; render(); });
     c.querySelectorAll("[data-add]").forEach(el=>el.onclick=()=>{ addLine(el.dataset.add); render(); });
 
     // 報價
@@ -543,7 +558,7 @@
     });
     c.querySelectorAll("[data-move]").forEach(el=>el.onchange=()=>{ quote.lines[+el.dataset.move].group=el.value; save(); render(); });
     // 快速加成本元件 → 跳到找產品並篩好該類元件
-    c.querySelectorAll("[data-quick]").forEach(el=>el.onclick=()=>{ briefOn=false; f={kw:el.dataset.quick,type:"元件",onlyActive:true}; view="search"; render(); toast("挑一個元件按「加入規劃」，會加到目前方案"); });
+    c.querySelectorAll("[data-quick]").forEach(el=>el.onclick=()=>{ briefOn=false; f={kw:el.dataset.quick,type:"元件",cat:"",onlyActive:true}; view="search"; render(); toast("挑一個元件按「加入規劃」，會加到目前方案"); });
     const csv=document.getElementById("q_csv"); if(csv) csv.onclick=exportCSV;
     const clr=document.getElementById("q_clear"); if(clr) clr.onclick=()=>{ if(confirm("確定清空報價單？")){ quote=newQuote(); save(); render(); } };
     const qs=document.getElementById("q_save"); if(qs) qs.onclick=saveQuote;
