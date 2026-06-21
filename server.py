@@ -215,6 +215,137 @@ def append_index_row(proposal, doc_url=None):
     return {"target": "檢索表登錄", "ok": False, "reason": "API 尚未接上"}
 
 
+# ---- 行程成本範本：存成 Google Drive 上的一份 JSON（全業務共用、重新部署不會不見）----
+TEMPLATE_FILENAME = "walkin_tour_templates.json"
+TEMPLATE_LOCAL = os.path.join(SUB_DIR, "_templates_cache.json")
+
+
+def _template_folder():
+    return os.environ.get("GDRIVE_TEMPLATE_FOLDER") or os.environ.get("GDRIVE_QUOTE_FOLDER")
+
+
+def _find_template_file(drive, folder):
+    """先用明確 file id，否則在資料夾裡用檔名找；找不到回 None。"""
+    fid = os.environ.get("GDRIVE_TEMPLATE_FILE_ID")
+    if fid:
+        return fid
+    q = f"name = '{TEMPLATE_FILENAME}' and trashed = false"
+    if folder:
+        q += f" and '{folder}' in parents"
+    res = drive.files().list(
+        q=q, spaces="drive", fields="files(id)", pageSize=1,
+        supportsAllDrives=True, includeItemsFromAllDrives=True,
+    ).execute()
+    files = res.get("files", [])
+    return files[0]["id"] if files else None
+
+
+def read_templates():
+    """回 {ok, templates, source}. 雲端讀不到時退回本機快取。"""
+    if google_configured():
+        try:
+            _, drive = _google_services()
+            fid = _find_template_file(drive, _template_folder())
+            if fid:
+                raw = drive.files().get_media(fileId=fid, supportsAllDrives=True).execute()
+                tpls = json.loads(raw.decode("utf-8")) if raw else {}
+                return {"ok": True, "templates": tpls, "source": "google"}
+            return {"ok": True, "templates": {}, "source": "google-empty"}
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            # 雲端失敗 → 退回本機快取，至少不要整個壞掉
+    if os.path.isfile(TEMPLATE_LOCAL):
+        try:
+            with open(TEMPLATE_LOCAL, encoding="utf-8") as f:
+                return {"ok": True, "templates": json.load(f), "source": "local"}
+        except Exception:
+            pass
+    return {"ok": True, "templates": {}, "source": "empty"}
+
+
+def write_templates(tpls):
+    """寫回 Drive 那份 JSON；同時寫一份本機快取當保險。"""
+    # 本機快取（即使雲端沒設定，也能跨分頁/重整保住）
+    try:
+        os.makedirs(SUB_DIR, exist_ok=True)
+        with _lock, open(TEMPLATE_LOCAL, "w", encoding="utf-8") as f:
+            json.dump(tpls, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+    if not google_configured():
+        return {"target": "Google雲端範本", "ok": False, "reason": "尚未設定 Google 服務帳號（已存本機快取）"}
+    folder = _template_folder()
+    if not folder and not os.environ.get("GDRIVE_TEMPLATE_FILE_ID"):
+        return {"target": "Google雲端範本", "ok": False, "reason": "尚未設定範本資料夾（GDRIVE_TEMPLATE_FOLDER 或沿用 GDRIVE_QUOTE_FOLDER）"}
+    try:
+        from googleapiclient.http import MediaInMemoryUpload
+        _, drive = _google_services()
+        body_bytes = json.dumps(tpls, ensure_ascii=False, indent=2).encode("utf-8")
+        media = MediaInMemoryUpload(body_bytes, mimetype="application/json", resumable=False)
+        fid = _find_template_file(drive, folder)
+        if fid:
+            drive.files().update(fileId=fid, media_body=media, supportsAllDrives=True).execute()
+        else:
+            meta = {"name": TEMPLATE_FILENAME, "mimeType": "application/json"}
+            if folder:
+                meta["parents"] = [folder]
+            f = drive.files().create(body=meta, media_body=media, fields="id", supportsAllDrives=True).execute()
+            fid = f["id"]
+        return {"target": "Google雲端範本", "ok": True, "id": fid}
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        return {"target": "Google雲端範本", "ok": False, "reason": str(e)[:500]}
+
+
+_tpl_lock = threading.RLock()
+
+
+def _tpl_same(a, b):
+    """只比對 name + items（忽略 rev / conflictOf 等中繼資料）。"""
+    return (a.get("name", "") == b.get("name", "")
+            and json.dumps(a.get("items", []), ensure_ascii=False, sort_keys=True)
+                == json.dumps(b.get("items", []), ensure_ascii=False, sort_keys=True))
+
+
+def apply_template_ops(ops):
+    """逐條套用 upsert/delete，以 rev 做樂觀鎖；偵測到同時編輯就把後到的另存成新範本（不覆蓋）。
+    回傳 {ok, templates(權威全集), conflicts, results}。"""
+    with _tpl_lock:
+        cur = (read_templates() or {}).get("templates") or {}
+        conflicts = []
+        for op in ops or []:
+            typ = op.get("op"); oid = op.get("id")
+            if not oid:
+                continue
+            base = int(op.get("baseRev") or 0)
+            existing = cur.get(oid)
+            if typ == "upsert":
+                inc = {"name": op.get("name", ""), "items": op.get("items", [])}
+                if not existing:
+                    cur[oid] = dict(inc, rev=1)
+                elif _tpl_same(existing, inc):
+                    pass  # 內容沒變，不動
+                elif int(existing.get("rev", 0)) == base:
+                    cur[oid] = dict(inc, rev=int(existing.get("rev", 0)) + 1)
+                else:
+                    # 衝突：保留雲端現有版，把這份另存成新範本
+                    vid = oid + "__c" + os.urandom(3).hex()
+                    base_name = existing.get("name") or inc.get("name") or oid
+                    vname = (inc.get("name") or base_name) + "（衝突副本·待合併）"
+                    cur[vid] = dict(inc, name=vname, rev=1, conflictOf=oid)
+                    conflicts.append({"id": oid, "baseName": base_name, "variantId": vid, "variantName": vname})
+            elif typ == "delete":
+                if not existing:
+                    pass
+                elif int(existing.get("rev", 0)) == base:
+                    cur.pop(oid, None)
+                else:
+                    # 刪除衝突：別人改過了 → 不刪，保留雲端版並回報
+                    conflicts.append({"id": oid, "baseName": existing.get("name") or oid, "kept": True})
+        res = write_templates(cur)
+        return {"ok": bool(res.get("ok")), "templates": cur, "conflicts": conflicts, "results": [res]}
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "WalkinProductTool/0.2"
 
@@ -279,7 +410,10 @@ class Handler(BaseHTTPRequestHandler):
                 "google": google_configured(),
                 "zoho": bool(os.environ.get("ZOHO_REFRESH_TOKEN")),
                 "indexSheet": bool(os.environ.get("INDEX_SHEET_ID")),
+                "templates": bool(_template_folder() or os.environ.get("GDRIVE_TEMPLATE_FILE_ID")),
             }})
+        if path == "/api/templates":
+            return self._json(read_templates())
         return self._static(path)
 
     def do_POST(self):
@@ -298,6 +432,14 @@ class Handler(BaseHTTPRequestHandler):
                 drive = write_proposal_to_drive(p)
                 idx = append_index_row(p, drive.get("url"))
                 return self._json({"saved": fn, "results": [drive, idx]})
+            if path == "/api/templates":
+                body = self._body()
+                if isinstance(body, dict) and isinstance(body.get("ops"), list):
+                    return self._json(apply_template_ops(body["ops"]))
+                # 相容舊版：整包覆蓋
+                tpls = body.get("templates", body) if isinstance(body, dict) else {}
+                res = write_templates(tpls)
+                return self._json({"results": [res]})
         except Exception as e:
             return self._json({"error": str(e)}, 400)
         return self._json({"error": "unknown endpoint"}, 404)

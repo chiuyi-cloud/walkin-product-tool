@@ -33,10 +33,98 @@
   const TPL_LS = "walkin_tour_templates_v1";
   function loadTpls(){ try{ return JSON.parse(localStorage.getItem(TPL_LS))||{}; }catch(e){ return {}; } }
   let TEMPLATES = loadTpls();
-  function saveTpls(){ localStorage.setItem(TPL_LS, JSON.stringify(TEMPLATES)); }
+  function saveTplsLocal(){ localStorage.setItem(TPL_LS, JSON.stringify(TEMPLATES)); }
+  // 逐條同步：記住「改過的(dirty)」與「刪掉的(deleted)」行程 id，連同各自版本(rev)上傳，由後端判斷衝突
+  const tplDirty=new Set(), tplDeleted=new Set();
+  function saveTpls(id){ if(id){ tplDirty.add(id); tplDeleted.delete(id); } saveTplsLocal(); schedulePush(); }
+  function delTpl(id){ delete TEMPLATES[id]; tplDeleted.add(id); tplDirty.delete(id); saveTplsLocal(); schedulePush(); }
   let tplTour="", tplKw="";
-  const QTY_MODES=[{v:"perPerson",l:"每人×人數"},{v:"perGuide",l:"每25人1位"},{v:"perBus",l:"每43人1台"},{v:"fixed",l:"固定數量"}];
-  function calcQty(mode,n,H){ if(mode==="perPerson")return H; if(mode==="perGuide")return Math.max(1,Math.ceil(H/25)); if(mode==="perBus")return Math.max(1,Math.ceil(H/43)); return Number(n)||1; }
+
+  // ---- 範本雲端同步（只有部署版＝同源後端才啟用）----
+  let tplSync = { state:"idle", msg:"" };   // idle|saving|saved|error|conflict
+  function cloudEnabled(){ return API_BASE===""; }
+  function hm(){ const d=new Date(); return ("0"+d.getHours()).slice(-2)+":"+("0"+d.getMinutes()).slice(-2); }
+  function setSync(state,msg){ tplSync={state,msg}; const el=document.getElementById("tplSyncBadge"); if(el) el.outerHTML=syncBadgeHTML(); }
+  function syncBadgeHTML(){
+    if(!cloudEnabled()) return `<span id="tplSyncBadge" class="tag" style="background:#e5e7eb;color:#374151">📄 本機暫存（試用版不同步）</span>`;
+    const map={idle:["#e0f2fe","#075985","☁︎ 雲端同步已開"],saving:["#fef9c3","#854d0e","⟳ 同步中…"],saved:["#dcfce7","#166534","✓ "],error:["#fee2e2","#991b1b","⚠️ "],conflict:["#fef3c7","#92400e","⚠️ "]};
+    const [bg,fg,pre]=map[tplSync.state]||map.idle;
+    return `<span id="tplSyncBadge" class="tag" style="background:${bg};color:${fg}">${pre}${esc(tplSync.msg||"")}</span>`;
+  }
+  let _pushTimer=null;
+  function schedulePush(){ if(!cloudEnabled()) return; if(!tplDirty.size && !tplDeleted.size) return; clearTimeout(_pushTimer); setSync("saving","同步中…"); _pushTimer=setTimeout(cloudPush,800); }
+  async function cloudPush(){
+    if(!cloudEnabled() || (!tplDirty.size && !tplDeleted.size)) return;
+    // 收集這批要送的操作（帶各自的 baseRev＝本機載入時的版本）
+    const ops=[];
+    tplDirty.forEach(id=>{ const t=TEMPLATES[id]; if(t) ops.push({op:"upsert", id, name:t.name||"", items:t.items||[], baseRev:t.rev||0}); });
+    tplDeleted.forEach(id=>ops.push({op:"delete", id, baseRev:(TEMPLATES[id]&&TEMPLATES[id].rev)||0}));
+    const sentDirty=[...tplDirty], sentDeleted=[...tplDeleted];
+    const localBefore=TEMPLATES;
+    // 送出前先清標記；若同步期間又被編輯，會重新標記、下輪再送
+    tplDirty.clear(); tplDeleted.clear();
+    try{
+      const res=await postJSON("/api/templates",{ops});
+      if(res.templates){
+        TEMPLATES=res.templates;
+        // 同步期間又被改到的行程：保留本機版本（採用伺服器新版本號，避免誤判成自己跟自己衝突）
+        tplDirty.forEach(id=>{ if(localBefore[id]){ const keep=localBefore[id]; if(res.templates[id]) keep.rev=res.templates[id].rev; TEMPLATES[id]=keep; } });
+        tplDeleted.forEach(id=>delete TEMPLATES[id]);
+        saveTplsLocal();
+      }
+      const conflicts=res.conflicts||[];
+      if(conflicts.length){
+        setSync("conflict","偵測到同時編輯，已另存新範本 "+hm());
+        toast("⚠️ "+conflicts.map(c=>c.kept
+          ? `「${c.baseName||c.id}」已被別人修改，刪除/變更未套用，請到範本總覽核對`
+          : `「${c.baseName||c.id}」有人同時修改，你的版本已另存為新範本『${c.variantName}』，請到範本總覽核對`).join("；"));
+      } else {
+        setSync("saved","已同步雲端 "+hm());
+      }
+      if(view==="template") render();
+      if(tplDirty.size||tplDeleted.size) schedulePush();   // 同步期間又有新編輯 → 再送一輪
+    }catch(e){
+      // 失敗：把這批標記放回去，下次重送，避免漏存
+      sentDirty.forEach(id=>tplDirty.add(id)); sentDeleted.forEach(id=>tplDeleted.add(id));
+      setSync("error","雲端同步失敗（後端未啟動？）");
+    }
+  }
+  async function cloudPull(){
+    if(!cloudEnabled()) return;
+    try{
+      const r=await fetch(API_BASE+"/api/templates"); if(!r.ok) throw 0;
+      const data=await r.json(); const cloud=data.templates||{};
+      const cKeys=Object.keys(cloud), lKeys=Object.keys(TEMPLATES);
+      if(cKeys.length){ TEMPLATES=cloud; saveTplsLocal(); setSync("saved","已從雲端載入 "+cKeys.length+" 條範本"); if(view==="template") render(); }
+      else if(lKeys.length){ lKeys.forEach(id=>tplDirty.add(id)); await cloudPush(); }   // 雲端空、本機有 → 全部推上去當初始
+      else { setSync("idle","雲端尚無範本，開始設定即會同步"); }
+    }catch(e){ setSync("error","雲端載入失敗，先用本機資料"); }
+  }
+  // 數量規則：needN=該規則需要填一個數字 n（每N人1個的 N、或固定數量），nLabel 提示 n 是什麼
+  const QTY_MODES=[
+    {v:"perPerson",    l:"每人（×人數）",          needN:false},
+    {v:"perPersonDay", l:"每人每天（×人數×天數）", needN:false},
+    {v:"perGroup",     l:"每 N 人 1 個",           needN:true, nLabel:"N 人"},
+    {v:"perGroupDay",  l:"每 N 人 1 個·每天",       needN:true, nLabel:"N 人"},
+    {v:"perDay",       l:"每天（×天數）",           needN:false},
+    {v:"fixed",        l:"固定數量",               needN:true, nLabel:"數量"},
+  ];
+  function modeNeedsN(mode){ const m=QTY_MODES.find(x=>x.v===mode); return m?m.needN:false; }
+  function daysOf(dur){ return dur==="三日"?3 : dur==="二日"?2 : 1; }   // 半日/一日=1
+  function calcQty(mode,n,H,D){
+    H=Number(H)||0; D=Number(D)||1; n=Number(n)||1;
+    switch(mode){
+      case "perPerson":    return H;
+      case "perPersonDay": return H*D;
+      case "perGroup":     return Math.max(1,Math.ceil(H/(n||1)));
+      case "perGroupDay":  return Math.max(1,Math.ceil(H/(n||1)))*D;
+      case "perDay":       return D;
+      case "perGuide":     return Math.max(1,Math.ceil(H/25));  // 舊範本相容
+      case "perBus":       return Math.max(1,Math.ceil(H/43));  // 舊範本相容
+      case "fixed":
+      default:             return n||1;
+    }
+  }
 
   function load(){
     try{ const q=JSON.parse(localStorage.getItem(LS)); return q? Object.assign(newQuote(), q) : newQuote(); }
@@ -284,10 +372,11 @@
   // 成本範本：有設定該行程的專屬範本就用它，否則用通用範本 — 皆依人數試算
   function addCostTemplate(tour, group, multiDay){
     const H=quote.headcount||1;
+    const D=daysOf(quote.duration);
     const add=(o)=>quote.lines.push(Object.assign({type:"元件",priceRange:"",tpl:true}, o));
     const saved=TEMPLATES[tour.id];
     if(saved && saved.items && saved.items.length){
-      saved.items.forEach(it=>add({id:it.id,name:it.name,unit:it.unit||"項",unitPrice:it.unitPrice||0,qty:calcQty(it.mode,it.n,H),group}));
+      saved.items.forEach(it=>add({id:it.id,name:it.name,unit:it.unit||"項",unitPrice:it.unitPrice||0,qty:calcQty(it.mode,it.n,H,D),group}));
     } else {
       const g=pickComp("帶路人 4000","帶路人","導覽員 1600","導覽員"); if(g) add({id:g.id,name:g.name,unit:g.unit||"項",unitPrice:g.unitPrice||0,qty:Math.max(1,Math.ceil(H/25)),group});
       const me=pickComp("便當","司領餐","餐食"); if(me) add({id:me.id,name:me.name,unit:me.unit||"人",unitPrice:me.unitPrice||0,qty:H,group});
@@ -519,28 +608,85 @@
       const tour=ALL.find(p=>p.id===tplTour)||{};
       const tpl=TEMPLATES[tplTour]||{items:[]};
       const items=tpl.items||[];
-      const rows=items.map((it,i)=>`<tr>
+      const rows=items.map((it,i)=>{
+        const md=QTY_MODES.find(m=>m.v===it.mode);
+        const showN=modeNeedsN(it.mode);
+        return `<tr>
         <td>${esc(it.name)}</td>
         <td><select data-tplmode="${i}" style="font-size:12px;padding:4px">${QTY_MODES.map(m=>`<option value="${m.v}" ${it.mode===m.v?"selected":""}>${m.l}</option>`).join("")}</select>
-          <input class="qty-inp" data-tpln="${i}" value="${esc(it.n||1)}" style="width:60px;${it.mode==="fixed"?"":"display:none"}"></td>
+          <input class="qty-inp" data-tpln="${i}" value="${esc(it.n||1)}" title="${md&&md.nLabel?esc(md.nLabel):""}" style="width:56px;${showN?"":"display:none"}">
+          ${showN&&md&&md.nLabel?`<span style="font-size:11px;color:var(--muted)">${esc(md.nLabel)}</span>`:""}
+          <div style="font-size:11px;color:var(--muted);margin-top:2px">試算量：${calcQty(it.mode,it.n,quote.headcount||30,daysOf(quote.duration))}（${esc(quote.headcount||30)}人${daysOf(quote.duration)>1?"×"+daysOf(quote.duration)+"天":""}）</div></td>
         <td class="num"><input class="price-inp" data-tplprice="${i}" value="${esc(it.unitPrice)}"></td>
         <td><button class="lineDel" data-tpldel="${i}" title="移除">×</button></td>
-      </tr>`).join("");
+      </tr>`;}).join("");
+      const H=quote.headcount||30, D=daysOf(quote.duration);
+      const tplCost=items.reduce((s,it)=>s+calcQty(it.mode,it.n,H,D)*(Number(it.unitPrice)||0),0);
+      const otherTours=prods.filter(p=>p.id!==tplTour);
+      const dupOpts=otherTours.map(p=>`<option value="${esc(p.id)}">${esc(p.name)}${TEMPLATES[p.id]&&TEMPLATES[p.id].items&&TEMPLATES[p.id].items.length?"（已有範本，會覆蓋）":""}</option>`).join("");
       body=`<div class="card" style="padding:18px;margin-top:14px">
-        <h3 style="margin:0 0 4px">${esc(tour.name)}</h3>
-        <div style="font-size:12.5px;color:var(--muted);margin-bottom:12px">設定此行程實際包含的成本元件與數量規則。之後在報價加入這條行程，就會帶入這份成本（取代通用範本）。</div>
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap">
+          <div><h3 style="margin:0 0 4px">${esc(tour.name||tpl.name||tplTour)}</h3>
+          <div style="font-size:12.5px;color:var(--muted)">${tpl.conflictOf?`⚠️ 這是<b>衝突副本</b>（有人同時改了同一條範本，系統把你的版本另存於此）。核對後可用下方「複製這份範本到」貼回正本行程，再到總覽刪掉此副本。`:`設定此行程實際包含的成本元件與數量規則。之後在報價加入這條行程，就會帶入這份成本（取代通用範本）。`}</div></div>
+          <button class="btn ghost sm" data-tplback>← 回範本總覽</button>
+        </div>
         ${items.length?`<div style="overflow:auto"><table>
           <thead><tr><th>元件</th><th>數量規則</th><th class="num">單價(成本)</th><th></th></tr></thead>
-          <tbody>${rows}</tbody></table></div>`:`<div style="color:var(--muted);font-size:13px;padding:8px 0">尚未加入元件。用下方關鍵字搜尋元件加入。</div>`}
+          <tbody>${rows}</tbody></table></div>
+          <div style="text-align:right;font-size:12.5px;color:var(--muted);margin-top:6px">此範本試算成本（${esc(H)}人${D>1?"×"+D+"天":""}）：<b style="color:var(--ink,#111)">${nf(tplCost)}</b></div>`:`<div style="color:var(--muted);font-size:13px;padding:8px 0">尚未加入元件。用下方關鍵字搜尋元件加入。</div>`}
         <div style="margin-top:16px;border-top:1px solid var(--line);padding-top:14px">
           <label class="bfld" style="max-width:420px"><span>加入元件（關鍵字）</span><input class="inp" id="tpl_kw" value="${esc(tplKw)}" placeholder="例：導覽員、便當、43座大巴、保險、住宿"></label>
           <div class="chips" id="tplPickList">${tplPickList()}</div>
         </div>
+        ${items.length?`<div style="margin-top:16px;border-top:1px solid var(--line);padding-top:14px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:12.5px">
+          <span style="color:var(--muted)">複製這份範本到：</span>
+          <select id="tpl_dupto" class="inp" style="max-width:300px;font-size:12px">${dupOpts}</select>
+          <button class="btn ghost sm" id="tpl_dupbtn">複製過去</button>
+          <span style="flex:1"></span>
+          <button class="btn ghost sm" id="tpl_wipe" style="color:var(--danger)">清空此範本</button>
+        </div>`:""}
       </div>`;
     }
+    const overview = tplTour ? "" : tplOverview(prods);
+    const syncBar = `<div style="display:flex;align-items:center;gap:10px;margin:0 0 12px;flex-wrap:wrap">
+      ${syncBadgeHTML()}
+      ${cloudEnabled()?`<button class="btn ghost sm" id="tpl_pull">↻ 重新從雲端載入</button><span style="color:var(--muted);font-size:11.5px">範本全業務共用，存在 Google 雲端；變更會自動同步。</span>`:`<span style="color:var(--muted);font-size:11.5px">目前是試用版（單機）；部署版會自動同步到雲端、全業務共用。</span>`}
+    </div>`;
     return `<div class="hint info">📐 為每條主行程設定它「實際包含哪些成本元件、各多少」。設定後，報價加入這條行程時就帶入<b>它專屬的成本</b>（不再用通用範本），試算更準。建議先設你們最常賣的幾條。</div>
+      ${syncBar}
       <label class="bfld" style="max-width:560px"><span>選擇要設定的主行程</span><select class="inp" id="tpl_tour"><option value="">— 請選擇主行程 —</option>${opts}</select></label>
-      ${body}`;
+      ${body}${overview}`;
+  }
+  // 範本總覽：列出所有已設定專屬範本的行程，可一眼看數量/試算成本，並編輯或刪除
+  function tplOverview(prods){
+    const ids=Object.keys(TEMPLATES).filter(id=>TEMPLATES[id]&&TEMPLATES[id].items&&TEMPLATES[id].items.length);
+    if(!ids.length) return `<div class="card empty" style="margin-top:14px"><div class="big">📐</div><div>還沒有任何專屬範本</div><div style="margin-top:8px;color:var(--muted);font-size:12.5px">從上方選一條主行程，把它常用的成本元件加進去。其餘行程在報價時會先用「通用範本」粗估。</div></div>`;
+    const H=quote.headcount||30, D=daysOf(quote.duration);
+    // 衝突副本排在最前面，提醒先處理
+    ids.sort((a,b)=>(TEMPLATES[b].conflictOf?1:0)-(TEMPLATES[a].conflictOf?1:0));
+    const conflictCount=ids.filter(id=>TEMPLATES[id].conflictOf).length;
+    const rows=ids.map(id=>{
+      const t=TEMPLATES[id];
+      const isConflict=!!t.conflictOf;
+      const name=t.name||(prods.find(p=>p.id===id)||{}).name||id;
+      const gone=!isConflict && !prods.some(p=>p.id===id);   // 行程已不在目前產品快照（衝突副本不算）
+      const cost=t.items.reduce((s,it)=>s+calcQty(it.mode,it.n,H,D)*(Number(it.unitPrice)||0),0);
+      const noPrice=t.items.some(it=>!(Number(it.unitPrice)>0));
+      return `<tr${isConflict?' style="background:#fffbeb"':''}>
+        <td>${esc(name)}${isConflict?` <span class="tag" style="background:#fef3c7;color:#92400e">⚠️ 衝突副本·待合併</span>`:""}${gone?` <span class="tag" style="background:#fee2e2;color:#991b1b">行程已不在快照</span>`:""}${noPrice?` <span class="tag" style="background:#fef3c7;color:#92400e">有元件缺價</span>`:""}</td>
+        <td class="num">${t.items.length}</td>
+        <td class="num"><b>${nf(cost)}</b></td>
+        <td style="white-space:nowrap"><button class="btn ghost sm" data-tpledit="${esc(id)}">${isConflict?"核對":"編輯"}</button> <button class="lineDel" data-tplwipe="${esc(id)}" title="刪除整份範本">×</button></td>
+      </tr>`;
+    }).join("");
+    const conflictBanner=conflictCount?`<div class="hint" style="margin:0 0 12px;background:#fffbeb;border-color:#fde68a;color:#92400e">⚠️ 有 <b>${conflictCount}</b> 份「衝突副本」：表示有人和你同時改了同一條範本，系統把後存的那份另存於此，沒有覆蓋掉別人的。請點「核對」確認內容，需要的話用副本裡的「複製這份範本到」貼回正本，再刪掉副本。</div>`:"";
+    return `<div class="card" style="padding:18px;margin-top:14px">
+      <h3 style="margin:0 0 10px">已設定的專屬範本（${ids.length}）</h3>
+      ${conflictBanner}
+      <div style="overflow:auto"><table>
+        <thead><tr><th>主行程</th><th class="num">元件數</th><th class="num">試算成本（${esc(H)}人${D>1?"×"+D+"天":""}）</th><th>操作</th></tr></thead>
+        <tbody>${rows}</tbody></table></div>
+    </div>`;
   }
 
   function renderPast(){
@@ -627,6 +773,7 @@
     }
 
     // 行程成本範本
+    const tpull=document.getElementById("tpl_pull"); if(tpull) tpull.onclick=async()=>{ setSync("saving","載入中…"); await cloudPull(); render(); };
     const tt=document.getElementById("tpl_tour"); if(tt) tt.onchange=()=>{ tplTour=tt.value; tplKw=""; render(); };
     const tkw=document.getElementById("tpl_kw");
     if(tkw){
@@ -634,18 +781,38 @@
     }
     bindTplAdd();
     function ensureTpl(){ if(!TEMPLATES[tplTour]) TEMPLATES[tplTour]={name:(ALL.find(p=>p.id===tplTour)||{}).name||"",items:[]}; return TEMPLATES[tplTour]; }
-    c.querySelectorAll("[data-tplmode]").forEach(el=>el.onchange=()=>{ TEMPLATES[tplTour].items[+el.dataset.tplmode].mode=el.value; saveTpls(); render(); });
-    c.querySelectorAll("[data-tpln]").forEach(el=>el.onchange=()=>{ TEMPLATES[tplTour].items[+el.dataset.tpln].n=parseFloat(el.value)||1; saveTpls(); });
-    c.querySelectorAll("[data-tplprice]").forEach(el=>el.onchange=()=>{ TEMPLATES[tplTour].items[+el.dataset.tplprice].unitPrice=parseFloat(el.value)||0; saveTpls(); });
-    c.querySelectorAll("[data-tpldel]").forEach(el=>el.onclick=()=>{ TEMPLATES[tplTour].items.splice(+el.dataset.tpldel,1); saveTpls(); render(); });
+    c.querySelectorAll("[data-tplmode]").forEach(el=>el.onchange=()=>{ TEMPLATES[tplTour].items[+el.dataset.tplmode].mode=el.value; saveTpls(tplTour); render(); });
+    c.querySelectorAll("[data-tpln]").forEach(el=>el.onchange=()=>{ TEMPLATES[tplTour].items[+el.dataset.tpln].n=parseFloat(el.value)||1; saveTpls(tplTour); render(); });
+    c.querySelectorAll("[data-tplprice]").forEach(el=>el.onchange=()=>{ TEMPLATES[tplTour].items[+el.dataset.tplprice].unitPrice=parseFloat(el.value)||0; saveTpls(tplTour); });
+    c.querySelectorAll("[data-tpldel]").forEach(el=>el.onclick=()=>{ TEMPLATES[tplTour].items.splice(+el.dataset.tpldel,1); saveTpls(tplTour); render(); });
+    // 總覽：編輯 / 刪除整份
+    c.querySelectorAll("[data-tpledit]").forEach(el=>el.onclick=()=>{ tplTour=el.dataset.tpledit; tplKw=""; render(); });
+    c.querySelectorAll("[data-tplwipe]").forEach(el=>el.onclick=()=>{ const id=el.dataset.tplwipe; const nm=(TEMPLATES[id]&&TEMPLATES[id].name)||id; if(confirm(`刪除「${nm}」的整份成本範本？此行程之後報價會改用通用範本。`)){ delTpl(id); render(); toast("已刪除範本"); } });
+    // 編輯卡：回總覽 / 清空 / 複製到另一條行程
+    const tback=c.querySelector("[data-tplback]"); if(tback) tback.onclick=()=>{ tplTour=""; render(); };
+    const twipe=document.getElementById("tpl_wipe"); if(twipe) twipe.onclick=()=>{ if(confirm("清空此行程的所有範本元件？")){ delTpl(tplTour); tplTour=""; render(); toast("已清空"); } };
+    const tdup=document.getElementById("tpl_dupbtn"); if(tdup) tdup.onclick=()=>{
+      const sel=document.getElementById("tpl_dupto"); const dst=sel&&sel.value; if(!dst) return;
+      const src=TEMPLATES[tplTour]; if(!src||!src.items||!src.items.length){ toast("這份範本是空的"); return; }
+      const dstName=(ALL.find(p=>p.id===dst)||{}).name||dst;
+      if(TEMPLATES[dst]&&TEMPLATES[dst].items&&TEMPLATES[dst].items.length && !confirm(`「${dstName}」已有範本，確定覆蓋？`)) return;
+      TEMPLATES[dst]={name:dstName, items:src.items.map(it=>Object.assign({},it)), rev:(TEMPLATES[dst]&&TEMPLATES[dst].rev)||0};
+      saveTpls(dst); tplTour=dst; tplKw=""; render(); toast("已複製到："+dstName);
+    };
     function bindTplAdd(){
       document.querySelectorAll("[data-tpladd]").forEach(el=>el.onclick=()=>{
         const m=ALL.find(x=>x.id===el.dataset.tpladd); if(!m) return;
         const t=ensureTpl();
         if(t.items.some(it=>it.id===m.id)){ toast("已在範本中"); return; }
-        const mode=/帶路人|導覽員|人力/.test(m.name)?"perGuide":(/大巴|中巴|遊覽車|巴士/.test(m.name)?"perBus":((/保險|便當|餐|門票|體驗/.test(m.name)||m.unit==="人")?"perPerson":"fixed"));
-        t.items.push({id:m.id,name:m.name,unit:m.unit||"項",unitPrice:m.unitPrice||0,mode,n:1});
-        saveTpls(); render(); toast("已加入範本："+m.name);
+        // 依元件名稱猜一個合理的數量規則與 N（業務可再改）
+        let mode="fixed", n=1;
+        if(/帶路人|導覽員|人力/.test(m.name)){ mode="perGroup"; n=25; }
+        else if(/大巴|遊覽車/.test(m.name)){ mode="perGroup"; n=43; }
+        else if(/中巴|小巴/.test(m.name)){ mode="perGroup"; n=20; }
+        else if(/巴士/.test(m.name)){ mode="perGroup"; n=43; }
+        else if(/保險|便當|餐|門票|體驗/.test(m.name)||m.unit==="人"){ mode="perPerson"; }
+        t.items.push({id:m.id,name:m.name,unit:m.unit||"項",unitPrice:m.unitPrice||0,mode,n});
+        saveTpls(tplTour); render(); toast("已加入範本："+m.name);
       });
     }
   }
@@ -748,4 +915,5 @@
   if(fbBtn) fbBtn.onclick=openFeedback;
 
   render();
+  cloudPull();   // 部署版：開啟時先把雲端共用範本拉下來（試用版會自動略過）
 })();
