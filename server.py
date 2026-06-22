@@ -18,7 +18,7 @@
 
 啟動： python3 server.py        （預設 port 4181）
 """
-import base64, hmac, json, os, re, threading, datetime
+import base64, hashlib, hmac, json, os, re, threading, time, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
@@ -29,6 +29,21 @@ SUB_DIR = os.path.join(BASE_DIR, "submissions")
 AUTH_USER = os.environ.get("AUTH_USER")
 AUTH_PASS = os.environ.get("AUTH_PASS")
 AUTH_ENABLED = bool(AUTH_USER and AUTH_PASS)
+
+# ── 個人登入：簽章密鑰（固定才能跨重新部署保留登入）＋ 第一位管理員 ──
+SESSION_SECRET = os.environ.get("SESSION_SECRET") or os.urandom(32).hex()  # 沒設＝臨時，重部署需重登
+SESSION_TTL = int(os.environ.get("SESSION_TTL_DAYS", "30")) * 86400
+
+# Google 登入（限定公司網域）
+GOOGLE_OAUTH_CLIENT_ID = os.environ.get("GOOGLE_OAUTH_CLIENT_ID")
+ALLOWED_DOMAIN = os.environ.get("ALLOWED_EMAIL_DOMAIN", "walkin.tw").strip().lower()
+ADMIN_EMAILS = set(e.strip().lower() for e in os.environ.get("ADMIN_EMAILS", "").split(",") if e.strip())
+
+# 密碼登入（預設關閉；只給本機開發或救生艇）
+ALLOW_PASSWORD_LOGIN = os.environ.get("ALLOW_PASSWORD_LOGIN", "").strip().lower() in ("1", "true", "yes")
+ADMIN_USER = os.environ.get("ADMIN_USER")        # 救生艇管理員帳號（需 ALLOW_PASSWORD_LOGIN）
+ADMIN_PASS = os.environ.get("ADMIN_PASS")
+ADMIN_NAME = os.environ.get("ADMIN_NAME", "管理員")
 
 STATIC_FILES = {
     "/": ("index.html", "text/html; charset=utf-8"),
@@ -297,6 +312,185 @@ def write_templates(tpls):
         return {"target": "Google雲端範本", "ok": False, "reason": str(e)[:500]}
 
 
+# ============ 個人帳號與登入 ============
+USERS_FILENAME = "walkin_users.json"
+USERS_LOCAL = os.path.join(SUB_DIR, "_users_cache.json")
+_users_lock = threading.RLock()
+
+
+def _users_find_file(drive, folder):
+    fid = os.environ.get("GDRIVE_USERS_FILE_ID")
+    if fid:
+        return fid
+    q = f"name = '{USERS_FILENAME}' and trashed = false"
+    if folder:
+        q += f" and '{folder}' in parents"
+    res = drive.files().list(q=q, spaces="drive", fields="files(id)", pageSize=1,
+                             supportsAllDrives=True, includeItemsFromAllDrives=True).execute()
+    files = res.get("files", [])
+    return files[0]["id"] if files else None
+
+
+def read_users():
+    if google_configured():
+        try:
+            _, drive = _google_services()
+            fid = _users_find_file(drive, _template_folder())
+            if fid:
+                raw = drive.files().get_media(fileId=fid, supportsAllDrives=True).execute()
+                return json.loads(raw.decode("utf-8")) if raw else {"users": []}
+            return {"users": []}
+        except Exception:
+            import traceback; traceback.print_exc()
+    if os.path.isfile(USERS_LOCAL):
+        try:
+            with open(USERS_LOCAL, encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"users": []}
+
+
+def write_users(store):
+    try:
+        os.makedirs(SUB_DIR, exist_ok=True)
+        with _lock, open(USERS_LOCAL, "w", encoding="utf-8") as f:
+            json.dump(store, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+    if not google_configured():
+        return False
+    folder = _template_folder()
+    if not folder and not os.environ.get("GDRIVE_USERS_FILE_ID"):
+        return False
+    try:
+        from googleapiclient.http import MediaInMemoryUpload
+        _, drive = _google_services()
+        body = json.dumps(store, ensure_ascii=False, indent=2).encode("utf-8")
+        media = MediaInMemoryUpload(body, mimetype="application/json", resumable=False)
+        fid = _users_find_file(drive, folder)
+        if fid:
+            drive.files().update(fileId=fid, media_body=media, supportsAllDrives=True).execute()
+        else:
+            meta = {"name": USERS_FILENAME, "mimeType": "application/json"}
+            if folder:
+                meta["parents"] = [folder]
+            drive.files().create(body=meta, media_body=media, fields="id", supportsAllDrives=True).execute()
+        return True
+    except Exception:
+        import traceback; traceback.print_exc()
+        return False
+
+
+def hash_pw(pw, salt=None, iters=120000):
+    """PBKDF2-HMAC-SHA256（標準庫）；只存 salt+hash，不存明碼。"""
+    salt = salt or os.urandom(16).hex()
+    dk = hashlib.pbkdf2_hmac("sha256", (pw or "").encode("utf-8"), bytes.fromhex(salt), iters)
+    return {"salt": salt, "iters": iters, "hash": dk.hex()}
+
+
+def verify_pw(pw, rec):
+    try:
+        dk = hashlib.pbkdf2_hmac("sha256", (pw or "").encode("utf-8"),
+                                 bytes.fromhex(rec["salt"]), int(rec.get("iters", 120000)))
+        return hmac.compare_digest(dk.hex(), rec.get("hash", ""))
+    except Exception:
+        return False
+
+
+def find_user(username):
+    uname = (username or "").strip().lower()
+    for u in read_users().get("users", []):
+        if u.get("u", "").lower() == uname:
+            return u
+    return None
+
+
+def _b64u(b):
+    return base64.urlsafe_b64encode(b).decode().rstrip("=")
+
+
+def _b64u_dec(s):
+    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+
+
+def issue_token(u, name, role):
+    payload = {"u": u, "name": name, "role": role, "exp": int(time.time()) + SESSION_TTL}
+    pb = _b64u(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+    sig = _b64u(hmac.new(SESSION_SECRET.encode(), pb.encode(), hashlib.sha256).digest())
+    return pb + "." + sig
+
+
+def verify_token(token):
+    try:
+        pb, sig = (token or "").split(".", 1)
+        exp_sig = _b64u(hmac.new(SESSION_SECRET.encode(), pb.encode(), hashlib.sha256).digest())
+        if not hmac.compare_digest(sig, exp_sig):
+            return None
+        payload = json.loads(_b64u_dec(pb).decode("utf-8"))
+        if int(payload.get("exp", 0)) < int(time.time()):
+            return None
+        return payload
+    except Exception:
+        return None
+
+
+def email_domain_ok(email):
+    email = (email or "").lower()
+    return bool(email) and email.endswith("@" + ALLOWED_DOMAIN)
+
+
+def verify_google_credential(credential):
+    """驗證 Google「Sign in with Google」回傳的 ID token；只放行 ALLOWED_DOMAIN。
+    成功回 {u(email), name, role}，失敗 raise。"""
+    from google.oauth2 import id_token as gid
+    from google.auth.transport import requests as greq
+    info = gid.verify_oauth2_token(credential, greq.Request(), GOOGLE_OAUTH_CLIENT_ID)
+    if not info.get("email_verified"):
+        raise ValueError("Google 信箱未驗證")
+    email = (info.get("email") or "").lower()
+    hd = (info.get("hd") or "").lower()
+    if not email_domain_ok(email) or (hd and hd != ALLOWED_DOMAIN):
+        raise ValueError("僅限 @" + ALLOWED_DOMAIN + " 公司信箱登入")
+    role = "admin" if email in ADMIN_EMAILS else "user"
+    return {"u": email, "name": info.get("name") or email.split("@")[0], "role": role}
+
+
+def authenticate(username, password):
+    """密碼登入（需 ALLOW_PASSWORD_LOGIN）。回身分 dict 或 None。"""
+    username = (username or "").strip()
+    if ADMIN_USER and ADMIN_PASS and username.lower() == ADMIN_USER.lower() \
+            and hmac.compare_digest(password or "", ADMIN_PASS):
+        return {"u": ADMIN_USER, "name": ADMIN_NAME, "role": "admin"}
+    rec = find_user(username)
+    if rec and verify_pw(password or "", rec):
+        return {"u": rec["u"], "name": rec.get("name", rec["u"]), "role": rec.get("role", "user")}
+    return None
+
+
+def create_user(username, name, password, role="user"):
+    """管理員建立帳號。回 {ok, reason?}。"""
+    username = (username or "").strip()
+    if not username or not password:
+        return {"ok": False, "reason": "帳號與密碼必填"}
+    if username.lower() == (ADMIN_USER or "").lower():
+        return {"ok": False, "reason": "此帳號名稱保留給內建管理員"}
+    with _users_lock:
+        store = read_users()
+        users = store.setdefault("users", [])
+        if any(x.get("u", "").lower() == username.lower() for x in users):
+            return {"ok": False, "reason": "帳號已存在"}
+        rec = {"u": username, "name": (name or username).strip(), "role": role}
+        rec.update(hash_pw(password))
+        users.append(rec)
+        write_users(store)
+    return {"ok": True}
+
+
+def _public_user(u):
+    return {"u": u.get("u"), "name": u.get("name", u.get("u")), "role": u.get("role", "user")}
+
+
 _tpl_lock = threading.RLock()
 
 
@@ -307,9 +501,46 @@ def _tpl_same(a, b):
                 == json.dumps(b.get("items", []), ensure_ascii=False, sort_keys=True))
 
 
-def apply_template_ops(ops):
+HISTORY_MAX = 40
+
+
+def _items_map(items):
+    m = {}
+    for it in items or []:
+        m[it.get("id") or it.get("name")] = it
+    return m
+
+
+def _diff_summary(old, new):
+    """自動算「改了什麼」：新增/移除/單價或數量規則變更。回簡短中文字串。"""
+    parts = []
+    if (old.get("name", "") != new.get("name", "")):
+        parts.append(f"名稱：{old.get('name','')}→{new.get('name','')}")
+    om, nm = _items_map(old.get("items", [])), _items_map(new.get("items", []))
+    for k, it in nm.items():
+        if k not in om:
+            parts.append(f"新增「{it.get('name','')}」")
+    for k, it in om.items():
+        if k not in nm:
+            parts.append(f"移除「{it.get('name','')}」")
+    for k, nit in nm.items():
+        oit = om.get(k)
+        if not oit:
+            continue
+        nm_ = nit.get("name", "")
+        if (oit.get("unitPrice") or 0) != (nit.get("unitPrice") or 0):
+            parts.append(f"「{nm_}」單價 {oit.get('unitPrice',0)}→{nit.get('unitPrice',0)}")
+        if oit.get("mode") != nit.get("mode") or (oit.get("n") or 1) != (nit.get("n") or 1):
+            parts.append(f"「{nm_}」數量規則調整")
+    return "；".join(parts[:8]) or "內容微調"
+
+
+def apply_template_ops(ops, editor=None):
     """逐條套用 upsert/delete，以 rev 做樂觀鎖；偵測到同時編輯就把後到的另存成新範本（不覆蓋）。
+    每次更新會把舊版收進 history，並記錄 日期/修改者/改了什麼。
     回傳 {ok, templates(權威全集), conflicts, results}。"""
+    who = (editor or {}).get("name") or "未知"
+    now = int(time.time())
     with _tpl_lock:
         cur = (read_templates() or {}).get("templates") or {}
         conflicts = []
@@ -318,30 +549,61 @@ def apply_template_ops(ops):
             if not oid:
                 continue
             base = int(op.get("baseRev") or 0)
+            note = (op.get("note") or "").strip()
             existing = cur.get(oid)
             if typ == "upsert":
                 inc = {"name": op.get("name", ""), "items": op.get("items", [])}
                 if not existing:
-                    cur[oid] = dict(inc, rev=1)
+                    cur[oid] = dict(inc, rev=1, history=[], updatedAt=now, updatedBy=who,
+                                    changeSummary="建立範本", changeNote=note,
+                                    conflictOf=op.get("conflictOf") or None)
+                    if not cur[oid].get("conflictOf"):
+                        cur[oid].pop("conflictOf", None)
                 elif _tpl_same(existing, inc):
                     pass  # 內容沒變，不動
                 elif int(existing.get("rev", 0)) == base:
-                    cur[oid] = dict(inc, rev=int(existing.get("rev", 0)) + 1)
+                    # 正常更新：把目前版本收進歷史，再寫入新版（新版自動成正式）
+                    hist = list(existing.get("history", []))
+                    hist.insert(0, {"rev": existing.get("rev", 0), "name": existing.get("name", ""),
+                                    "items": existing.get("items", []), "at": existing.get("updatedAt"),
+                                    "by": existing.get("updatedBy"), "summary": existing.get("changeSummary"),
+                                    "note": existing.get("changeNote")})
+                    summary = _diff_summary(existing, inc)
+                    cur[oid] = dict(inc, rev=int(existing.get("rev", 0)) + 1, history=hist[:HISTORY_MAX],
+                                    updatedAt=now, updatedBy=who, changeSummary=summary, changeNote=note)
+                    if existing.get("conflictOf"):
+                        cur[oid]["conflictOf"] = existing["conflictOf"]
                 else:
                     # 衝突：保留雲端現有版，把這份另存成新範本
                     vid = oid + "__c" + os.urandom(3).hex()
                     base_name = existing.get("name") or inc.get("name") or oid
                     vname = (inc.get("name") or base_name) + "（衝突副本·待合併）"
-                    cur[vid] = dict(inc, name=vname, rev=1, conflictOf=oid)
+                    cur[vid] = dict(inc, name=vname, rev=1, conflictOf=oid, history=[],
+                                    updatedAt=now, updatedBy=who, changeSummary="同時編輯衝突，另存", changeNote=note)
                     conflicts.append({"id": oid, "baseName": base_name, "variantId": vid, "variantName": vname})
             elif typ == "delete":
+                # 軟刪除：標記 archived 並留痕（誰、何時），可還原
                 if not existing:
                     pass
                 elif int(existing.get("rev", 0)) == base:
-                    cur.pop(oid, None)
+                    hist = list(existing.get("history", []))
+                    hist.insert(0, {"rev": existing.get("rev", 0), "name": existing.get("name", ""),
+                                    "items": existing.get("items", []), "at": existing.get("updatedAt"),
+                                    "by": existing.get("updatedBy"), "summary": existing.get("changeSummary"),
+                                    "note": existing.get("changeNote")})
+                    existing["archived"] = True
+                    existing["history"] = hist[:HISTORY_MAX]
+                    existing["rev"] = int(existing.get("rev", 0)) + 1
+                    existing["updatedAt"] = now; existing["updatedBy"] = who
+                    existing["changeSummary"] = "刪除範本"; existing["changeNote"] = note
                 else:
-                    # 刪除衝突：別人改過了 → 不刪，保留雲端版並回報
                     conflicts.append({"id": oid, "baseName": existing.get("name") or oid, "kept": True})
+            elif typ == "restore":
+                if existing and existing.get("archived"):
+                    existing["archived"] = False
+                    existing["rev"] = int(existing.get("rev", 0)) + 1
+                    existing["updatedAt"] = now; existing["updatedBy"] = who
+                    existing["changeSummary"] = "還原範本"; existing["changeNote"] = note
         res = write_templates(cur)
         return {"ok": bool(res.get("ok")), "templates": cur, "conflicts": conflicts, "results": [res]}
 
@@ -382,6 +644,13 @@ class Handler(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length", 0))
         return json.loads(self.rfile.read(n).decode("utf-8")) if n else {}
 
+    def _bearer_user(self):
+        """從 Authorization: Bearer <token> 取得已登入身分；無效回 None。"""
+        h = self.headers.get("Authorization", "")
+        if h.startswith("Bearer "):
+            return verify_token(h[7:].strip())
+        return None
+
     def _static(self, path):
         entry = STATIC_FILES.get(path)
         if not entry:
@@ -411,9 +680,22 @@ class Handler(BaseHTTPRequestHandler):
                 "zoho": bool(os.environ.get("ZOHO_REFRESH_TOKEN")),
                 "indexSheet": bool(os.environ.get("INDEX_SHEET_ID")),
                 "templates": bool(_template_folder() or os.environ.get("GDRIVE_TEMPLATE_FILE_ID")),
+                "login": True,
+                "googleClientId": GOOGLE_OAUTH_CLIENT_ID or "",
+                "passwordLogin": ALLOW_PASSWORD_LOGIN,
+                "domain": ALLOWED_DOMAIN,
             }})
         if path == "/api/templates":
-            return self._json(read_templates())
+            return self._json(read_templates())   # 看／用範本不需登入
+        if path == "/api/me":
+            u = self._bearer_user()
+            return self._json({"ok": bool(u), "user": _public_user(u) if u else None})
+        if path == "/api/users":
+            u = self._bearer_user()
+            if not u or u.get("role") != "admin":
+                return self._json({"ok": False, "reason": "需要管理員"}, 403)
+            users = [_public_user(x) for x in read_users().get("users", [])]
+            return self._json({"ok": True, "users": users})
         return self._static(path)
 
     def do_POST(self):
@@ -421,6 +703,32 @@ class Handler(BaseHTTPRequestHandler):
             return self._need_auth()
         path = urlparse(self.path).path
         try:
+            if path == "/api/login-google":
+                if not GOOGLE_OAUTH_CLIENT_ID:
+                    return self._json({"ok": False, "reason": "後端尚未設定 Google 登入"}, 400)
+                b = self._body()
+                try:
+                    u = verify_google_credential(b.get("credential"))
+                except Exception as e:
+                    return self._json({"ok": False, "reason": str(e)[:140] or "Google 登入驗證失敗"}, 401)
+                return self._json({"ok": True, "token": issue_token(u["u"], u["name"], u["role"]),
+                                   "user": _public_user(u)})
+            if path == "/api/login":
+                if not ALLOW_PASSWORD_LOGIN:
+                    return self._json({"ok": False, "reason": "已停用密碼登入，請改用公司 Google 帳號登入"}, 403)
+                b = self._body()
+                u = authenticate(b.get("username"), b.get("password"))
+                if not u:
+                    return self._json({"ok": False, "reason": "帳號或密碼錯誤"}, 401)
+                return self._json({"ok": True, "token": issue_token(u["u"], u["name"], u["role"]),
+                                   "user": _public_user(u)})
+            if path == "/api/users":   # 管理員建立帳號（密碼登入模式才有意義）
+                actor = self._bearer_user()
+                if not actor or actor.get("role") != "admin":
+                    return self._json({"ok": False, "reason": "需要管理員權限"}, 403)
+                b = self._body()
+                return self._json(create_user(b.get("username"), b.get("name"),
+                                              b.get("password"), b.get("role", "user")))
             if path == "/api/save-quote":
                 q = self._body()
                 fn = save_submission("quote", q)
@@ -433,9 +741,13 @@ class Handler(BaseHTTPRequestHandler):
                 idx = append_index_row(p, drive.get("url"))
                 return self._json({"saved": fn, "results": [drive, idx]})
             if path == "/api/templates":
+                # 改範本需登入：身分由 token 認定，不靠前端自報
+                actor = self._bearer_user()
+                if not actor:
+                    return self._json({"ok": False, "reason": "請先登入再修改範本", "needLogin": True}, 401)
                 body = self._body()
                 if isinstance(body, dict) and isinstance(body.get("ops"), list):
-                    return self._json(apply_template_ops(body["ops"]))
+                    return self._json(apply_template_ops(body["ops"], actor))
                 # 相容舊版：整包覆蓋
                 tpls = body.get("templates", body) if isinstance(body, dict) else {}
                 res = write_templates(tpls)

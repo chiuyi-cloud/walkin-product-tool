@@ -36,9 +36,15 @@
   function saveTplsLocal(){ localStorage.setItem(TPL_LS, JSON.stringify(TEMPLATES)); }
   // 逐條同步：記住「改過的(dirty)」與「刪掉的(deleted)」行程 id，連同各自版本(rev)上傳，由後端判斷衝突
   const tplDirty=new Set(), tplDeleted=new Set();
+  const tplNotes={};   // 這次變更的「改了什麼」備註（依 id），送出後清掉
   function saveTpls(id){ if(id){ tplDirty.add(id); tplDeleted.delete(id); } saveTplsLocal(); schedulePush(); }
-  function delTpl(id){ delete TEMPLATES[id]; tplDeleted.add(id); tplDirty.delete(id); saveTplsLocal(); schedulePush(); }
+  // 不在本機先刪：保留到送出時才讀得到 rev（baseRev），伺服器確認後再以回傳結果覆蓋（軟刪除→archived）
+  function delTpl(id){ tplDeleted.add(id); tplDirty.delete(id); if(TEMPLATES[id]) TEMPLATES[id]._pendingDel=true; saveTplsLocal(); schedulePush(); }
   let tplTour="", tplKw="";
+  let tplDraft=null;     // 編輯草稿（=正在「建立新版本」）：{id,name,items}；null=唯讀檢視
+  let tplHistOpen=false; // 是否展開版本歷史
+  function fmtTime(epochSec){ if(!epochSec) return "—"; try{ return new Date(epochSec*1000).toLocaleString("zh-TW",{year:"numeric",month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit"}); }catch(e){ return "—"; } }
+  function modeLabel(mode,n){ const m=QTY_MODES.find(x=>x.v===mode); if(!m) return mode||""; return m.needN?`${m.l}（${m.nLabel}=${n||1}）`:m.l; }
 
   // ---- 範本雲端同步（只有部署版＝同源後端才啟用）----
   let tplSync = { state:"idle", msg:"" };   // idle|saving|saved|error|conflict
@@ -47,7 +53,7 @@
   function setSync(state,msg){ tplSync={state,msg}; const el=document.getElementById("tplSyncBadge"); if(el) el.outerHTML=syncBadgeHTML(); }
   function syncBadgeHTML(){
     if(!cloudEnabled()) return `<span id="tplSyncBadge" class="tag" style="background:#e5e7eb;color:#374151">📄 本機暫存（試用版不同步）</span>`;
-    const map={idle:["#e0f2fe","#075985","☁︎ 雲端同步已開"],saving:["#fef9c3","#854d0e","⟳ 同步中…"],saved:["#dcfce7","#166534","✓ "],error:["#fee2e2","#991b1b","⚠️ "],conflict:["#fef3c7","#92400e","⚠️ "]};
+    const map={idle:["#e0f2fe","#075985","☁︎ 雲端同步已開"],saving:["#fef9c3","#854d0e","⟳ "],saved:["#dcfce7","#166534","✓ "],error:["#fee2e2","#991b1b","⚠️ "],conflict:["#fef3c7","#92400e","⚠️ "]};
     const [bg,fg,pre]=map[tplSync.state]||map.idle;
     return `<span id="tplSyncBadge" class="tag" style="background:${bg};color:${fg}">${pre}${esc(tplSync.msg||"")}</span>`;
   }
@@ -57,8 +63,9 @@
     if(!cloudEnabled() || (!tplDirty.size && !tplDeleted.size)) return;
     // 收集這批要送的操作（帶各自的 baseRev＝本機載入時的版本）
     const ops=[];
-    tplDirty.forEach(id=>{ const t=TEMPLATES[id]; if(t) ops.push({op:"upsert", id, name:t.name||"", items:t.items||[], baseRev:t.rev||0}); });
-    tplDeleted.forEach(id=>ops.push({op:"delete", id, baseRev:(TEMPLATES[id]&&TEMPLATES[id].rev)||0}));
+    tplDirty.forEach(id=>{ const t=TEMPLATES[id]; if(t) ops.push({op:"upsert", id, name:t.name||"", items:t.items||[], baseRev:t.rev||0, note:tplNotes[id]||""}); });
+    tplDeleted.forEach(id=>ops.push({op:"delete", id, baseRev:(TEMPLATES[id]&&TEMPLATES[id].rev)||0, note:tplNotes[id]||""}));
+    [...tplDirty,...tplDeleted].forEach(id=>delete tplNotes[id]);
     const sentDirty=[...tplDirty], sentDeleted=[...tplDeleted];
     const localBefore=TEMPLATES;
     // 送出前先清標記；若同步期間又被編輯，會重新標記、下輪再送
@@ -86,7 +93,8 @@
     }catch(e){
       // 失敗：把這批標記放回去，下次重送，避免漏存
       sentDirty.forEach(id=>tplDirty.add(id)); sentDeleted.forEach(id=>tplDeleted.add(id));
-      setSync("error","雲端同步失敗（後端未啟動？）");
+      if(e&&e.status===401){ setAuth(null); setSync("error","登入已過期，請重新登入後再存"); requireLogin(()=>cloudPush()); }
+      else setSync("error","雲端同步失敗（後端未啟動？）");
     }
   }
   async function cloudPull(){
@@ -100,6 +108,170 @@
       else { setSync("idle","雲端尚無範本，開始設定即會同步"); }
     }catch(e){ setSync("error","雲端載入失敗，先用本機資料"); }
   }
+  // 還原已刪除的範本（送 restore op）
+  function restoreTpl(id){
+    requireLogin(async()=>{
+      try{
+        setSync("saving","還原中…");
+        const res=await postJSON("/api/templates",{ops:[{op:"restore", id, baseRev:(TEMPLATES[id]&&TEMPLATES[id].rev)||0}]});
+        if(res.templates){ TEMPLATES=res.templates; saveTplsLocal(); }
+        setSync("saved","已還原 "+hm()); render(); toast("已還原範本");
+      }catch(e){ if(e&&e.status===401){ setAuth(null); requireLogin(()=>restoreTpl(id)); } else setSync("error","還原失敗"); }
+    });
+  }
+
+  // ---- 個人登入（看/用範本免登入；改範本才要登入）----
+  const AUTH_LS="walkin_auth_v1";
+  function loadAuth(){ try{ return JSON.parse(localStorage.getItem(AUTH_LS))||null; }catch(e){ return null; } }
+  let AUTH=loadAuth();
+  let SRV={googleClientId:"",passwordLogin:false,domain:"walkin.tw"};   // 後端登入設定
+  function isLoggedIn(){ return !!(AUTH&&AUTH.token); }
+  function isAdmin(){ return isLoggedIn() && AUTH.user && AUTH.user.role==="admin"; }
+  function meName(){ return (AUTH&&AUTH.user&&AUTH.user.name)||""; }
+  function authHeader(){ return isLoggedIn()?{"Authorization":"Bearer "+AUTH.token}:{}; }
+  function setAuth(a){ AUTH=a; if(a) localStorage.setItem(AUTH_LS,JSON.stringify(a)); else localStorage.removeItem(AUTH_LS); }
+  async function loadServerConfig(){
+    if(!cloudEnabled()) return;
+    try{ const d=await (await fetch(API_BASE+"/api/health")).json(); const c=(d&&d.configured)||{};
+      SRV.googleClientId=c.googleClientId||""; SRV.passwordLogin=!!c.passwordLogin; SRV.domain=c.domain||"walkin.tw"; }
+    catch(e){}
+  }
+  // 動態載入 Google Identity Services
+  let _gisP=null;
+  function loadGIS(){
+    if(window.google&&window.google.accounts&&window.google.accounts.id) return Promise.resolve();
+    if(_gisP) return _gisP;
+    _gisP=new Promise((res,rej)=>{ const s=document.createElement("script"); s.src="https://accounts.google.com/gsi/client"; s.async=true; s.defer=true; s.onload=()=>res(); s.onerror=()=>rej(new Error("無法載入 Google 登入元件")); document.head.appendChild(s); });
+    return _gisP;
+  }
+  async function doGoogleLogin(credential){
+    const r=await fetch(API_BASE+"/api/login-google",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({credential})});
+    const d=await r.json().catch(()=>({}));
+    if(r.ok && d.ok){ setAuth({token:d.token,user:d.user}); return {ok:true,user:d.user}; }
+    return {ok:false,reason:d.reason||("登入失敗 "+r.status)};
+  }
+  async function doLogin(username,password){
+    const r=await fetch(API_BASE+"/api/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({username,password})});
+    const d=await r.json().catch(()=>({}));
+    if(r.ok && d.ok){ setAuth({token:d.token,user:d.user}); return {ok:true,user:d.user}; }
+    return {ok:false,reason:d.reason||("登入失敗 "+r.status)};
+  }
+  function logout(){ setAuth(null); tplTour=""; toast("已登出"); render(); }
+  async function validateSession(){
+    if(!cloudEnabled() || !isLoggedIn()) return;
+    try{ const r=await fetch(API_BASE+"/api/me",{headers:authHeader()}); const d=await r.json();
+      if(!d.ok){ setAuth(null); if(view==="template") render(); } }
+    catch(e){}
+  }
+  let _afterLogin=null;
+  // 單機試用版（無後端）不需登入；部署版未登入則先跳登入框
+  function requireLogin(cb){ if(!cloudEnabled() || isLoggedIn()){ cb&&cb(); return; } _afterLogin=cb||null; openLoginModal(); }
+  function afterLoginOK(user, close){ const cb=_afterLogin; _afterLogin=null; if(close) close(); toast("已登入："+user.name); render(); cb&&cb(); }
+  function openLoginModal(){
+    if(document.getElementById("loginMask")) return;
+    const mask=document.createElement("div"); mask.id="loginMask";
+    mask.style.cssText="position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:9999";
+    const card=document.createElement("div");
+    card.style.cssText="background:#fff;border-radius:12px;padding:24px;width:360px;max-width:92vw;box-shadow:0 12px 40px rgba(0,0,0,.25)";
+    const close=()=>{ mask.remove(); };
+    if(SRV.googleClientId){
+      // Google 登入（限定公司網域）
+      card.innerHTML=`<h3 style="margin:0 0 4px">登入以修改範本</h3>
+        <div style="font-size:12.5px;color:var(--muted);margin-bottom:16px">請用你的 <b>@${esc(SRV.domain)}</b> 公司 Google 帳號登入。看／用範本不需登入；修改、刪除範本才需要，系統會記錄是誰改的。</div>
+        <div id="gbtn" style="display:flex;justify-content:center;min-height:44px"></div>
+        <div id="lg_err" style="color:var(--danger);font-size:12.5px;min-height:18px;margin-top:10px"></div>
+        <div style="display:flex;justify-content:flex-end;margin-top:6px"><button class="btn ghost" id="lg_cancel">取消</button></div>`;
+      mask.appendChild(card); document.body.appendChild(mask);
+      const err=document.getElementById("lg_err");
+      document.getElementById("lg_cancel").onclick=()=>{ _afterLogin=null; close(); };
+      mask.onclick=(e)=>{ if(e.target===mask){ _afterLogin=null; close(); } };
+      loadGIS().then(()=>{
+        window.google.accounts.id.initialize({ client_id:SRV.googleClientId, hd:SRV.domain, callback:async(resp)=>{
+          err.textContent="登入中…";
+          const res=await doGoogleLogin(resp.credential);
+          if(res.ok) afterLoginOK(res.user, close); else err.textContent=res.reason;
+        }});
+        window.google.accounts.id.renderButton(document.getElementById("gbtn"),{theme:"outline",size:"large",width:300,text:"signin_with"});
+      }).catch(()=>{ err.textContent="無法載入 Google 登入元件（請檢查網路）"; });
+      return;
+    }
+    if(SRV.passwordLogin){
+      // 密碼登入（本機開發／救生艇）
+      card.innerHTML=`<h3 style="margin:0 0 4px">登入以修改範本</h3>
+        <div style="font-size:12.5px;color:var(--muted);margin-bottom:14px">（密碼登入模式）看／用範本不需登入；修改、刪除範本才需要。</div>
+        <label class="bfld"><span>帳號</span><input class="inp" id="lg_u" autocomplete="username"></label>
+        <label class="bfld" style="margin-top:8px"><span>密碼</span><input class="inp" id="lg_p" type="password" autocomplete="current-password"></label>
+        <div id="lg_err" style="color:var(--danger);font-size:12.5px;min-height:18px;margin-top:8px"></div>
+        <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:8px"><button class="btn ghost" id="lg_cancel">取消</button><button class="btn" id="lg_ok">登入</button></div>`;
+      mask.appendChild(card); document.body.appendChild(mask);
+      const u=document.getElementById("lg_u"), p=document.getElementById("lg_p"), err=document.getElementById("lg_err");
+      u.focus();
+      document.getElementById("lg_cancel").onclick=()=>{ _afterLogin=null; close(); };
+      mask.onclick=(e)=>{ if(e.target===mask){ _afterLogin=null; close(); } };
+      const submit=async()=>{ err.textContent=""; const btn=document.getElementById("lg_ok"); btn.disabled=true; btn.textContent="登入中…";
+        const res=await doLogin(u.value.trim(),p.value); btn.disabled=false; btn.textContent="登入";
+        if(res.ok) afterLoginOK(res.user, close); else err.textContent=res.reason; };
+      document.getElementById("lg_ok").onclick=submit;
+      p.onkeydown=(e)=>{ if(e.key==="Enter") submit(); };
+      return;
+    }
+    // 尚未設定任何登入方式
+    card.innerHTML=`<h3 style="margin:0 0 8px">登入尚未設定</h3>
+      <div style="font-size:13px;color:var(--muted);margin-bottom:16px">後端還沒設定 Google 登入。請管理員在伺服器設定 <code>GOOGLE_OAUTH_CLIENT_ID</code> 後即可用公司 @${esc(SRV.domain)} 信箱登入。</div>
+      <div style="text-align:right"><button class="btn" id="lg_cancel">知道了</button></div>`;
+    mask.appendChild(card); document.body.appendChild(mask);
+    document.getElementById("lg_cancel").onclick=()=>{ _afterLogin=null; close(); };
+    mask.onclick=(e)=>{ if(e.target===mask){ _afterLogin=null; close(); } };
+  }
+  // 帳號管理（僅管理員）：列出帳號、新增帳號
+  async function openUsersModal(){
+    if(!isAdmin()) return;
+    if(document.getElementById("usersMask")) return;
+    const mask=document.createElement("div"); mask.id="usersMask";
+    mask.style.cssText="position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:9999";
+    mask.innerHTML=`<div style="background:#fff;border-radius:12px;padding:24px;width:460px;max-width:94vw;max-height:88vh;overflow:auto;box-shadow:0 12px 40px rgba(0,0,0,.25)">
+      <div style="display:flex;justify-content:space-between;align-items:center"><h3 style="margin:0">帳號管理</h3><button class="btn ghost sm" id="us_close">關閉</button></div>
+      <div id="us_list" style="margin:12px 0;font-size:13px;color:var(--muted)">載入中…</div>
+      <div style="border-top:1px solid var(--line);padding-top:12px">
+        <div style="font-weight:600;margin-bottom:8px">新增帳號</div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+          <label class="bfld"><span>帳號</span><input class="inp" id="us_u"></label>
+          <label class="bfld"><span>顯示名字</span><input class="inp" id="us_n" placeholder="例：小美"></label>
+          <label class="bfld"><span>密碼</span><input class="inp" id="us_p" type="text"></label>
+          <label class="bfld"><span>角色</span><select class="inp" id="us_r"><option value="user">業務</option><option value="admin">管理員</option></select></label>
+        </div>
+        <div id="us_err" style="color:var(--danger);font-size:12.5px;min-height:18px;margin-top:6px"></div>
+        <div style="text-align:right"><button class="btn" id="us_add">新增</button></div>
+      </div>
+    </div>`;
+    document.body.appendChild(mask);
+    const close=()=>mask.remove();
+    document.getElementById("us_close").onclick=close;
+    mask.onclick=(e)=>{ if(e.target===mask) close(); };
+    async function refresh(){
+      const box=document.getElementById("us_list");
+      try{
+        const r=await fetch(API_BASE+"/api/users",{headers:authHeader()});
+        const d=await r.json();
+        if(!d.ok){ box.textContent="讀取失敗："+(d.reason||r.status); return; }
+        box.innerHTML=`<table style="width:100%"><thead><tr><th style="text-align:left">帳號</th><th style="text-align:left">名字</th><th style="text-align:left">角色</th></tr></thead><tbody>${
+          d.users.map(u=>`<tr><td>${esc(u.u)}</td><td>${esc(u.name)}</td><td>${u.role==="admin"?"管理員":"業務"}</td></tr>`).join("")||'<tr><td colspan="3">尚無自建帳號（你是內建管理員）</td></tr>'}</tbody></table>`;
+      }catch(e){ box.textContent="讀取失敗（後端未啟動？）"; }
+    }
+    refresh();
+    document.getElementById("us_add").onclick=async()=>{
+      const err=document.getElementById("us_err"); err.textContent="";
+      const u=document.getElementById("us_u").value.trim(), n=document.getElementById("us_n").value.trim();
+      const p=document.getElementById("us_p").value, role=document.getElementById("us_r").value;
+      if(!u||!p){ err.textContent="帳號與密碼必填"; return; }
+      try{
+        const res=await postJSON("/api/users",{username:u,name:n,password:p,role});
+        if(res.ok){ toast("已新增帳號："+(n||u)); document.getElementById("us_u").value="";document.getElementById("us_n").value="";document.getElementById("us_p").value=""; refresh(); }
+        else err.textContent=res.reason||"新增失敗";
+      }catch(e){ err.textContent=(e&&e.data&&e.data.reason)||"新增失敗（需管理員或後端未啟動）"; }
+    };
+  }
+
   // 數量規則：needN=該規則需要填一個數字 n（每N人1個的 N、或固定數量），nLabel 提示 n 是什麼
   const QTY_MODES=[
     {v:"perPerson",    l:"每人（×人數）",          needN:false},
@@ -375,7 +547,7 @@
     const D=daysOf(quote.duration);
     const add=(o)=>quote.lines.push(Object.assign({type:"元件",priceRange:"",tpl:true}, o));
     const saved=TEMPLATES[tour.id];
-    if(saved && saved.items && saved.items.length){
+    if(saved && saved.items && saved.items.length && !saved.archived){
       saved.items.forEach(it=>add({id:it.id,name:it.name,unit:it.unit||"項",unitPrice:it.unitPrice||0,qty:calcQty(it.mode,it.n,H,D),group}));
     } else {
       const g=pickComp("帶路人 4000","帶路人","導覽員 1600","導覽員"); if(g) add({id:g.id,name:g.name,unit:g.unit||"項",unitPrice:g.unitPrice||0,qty:Math.max(1,Math.ceil(H/25)),group});
@@ -606,52 +778,100 @@
     let body="";
     if(tplTour){
       const tour=ALL.find(p=>p.id===tplTour)||{};
-      const tpl=TEMPLATES[tplTour]||{items:[]};
-      const items=tpl.items||[];
-      const rows=items.map((it,i)=>{
-        const md=QTY_MODES.find(m=>m.v===it.mode);
-        const showN=modeNeedsN(it.mode);
-        return `<tr>
-        <td>${esc(it.name)}</td>
-        <td><select data-tplmode="${i}" style="font-size:12px;padding:4px">${QTY_MODES.map(m=>`<option value="${m.v}" ${it.mode===m.v?"selected":""}>${m.l}</option>`).join("")}</select>
-          <input class="qty-inp" data-tpln="${i}" value="${esc(it.n||1)}" title="${md&&md.nLabel?esc(md.nLabel):""}" style="width:56px;${showN?"":"display:none"}">
-          ${showN&&md&&md.nLabel?`<span style="font-size:11px;color:var(--muted)">${esc(md.nLabel)}</span>`:""}
-          <div style="font-size:11px;color:var(--muted);margin-top:2px">試算量：${calcQty(it.mode,it.n,quote.headcount||30,daysOf(quote.duration))}（${esc(quote.headcount||30)}人${daysOf(quote.duration)>1?"×"+daysOf(quote.duration)+"天":""}）</div></td>
-        <td class="num"><input class="price-inp" data-tplprice="${i}" value="${esc(it.unitPrice)}"></td>
-        <td><button class="lineDel" data-tpldel="${i}" title="移除">×</button></td>
-      </tr>`;}).join("");
+      const official=TEMPLATES[tplTour]||{items:[]};
+      const editing = !!(tplDraft && tplDraft.id===tplTour);
+      const src = editing ? tplDraft : official;
+      const items = src.items||[];
       const H=quote.headcount||30, D=daysOf(quote.duration);
       const tplCost=items.reduce((s,it)=>s+calcQty(it.mode,it.n,H,D)*(Number(it.unitPrice)||0),0);
+      // 列：編輯模式可改、檢視模式唯讀
+      const rows=items.map((it,i)=>{
+        const md=QTY_MODES.find(m=>m.v===it.mode), showN=modeNeedsN(it.mode);
+        const qtyNote=`<div style="font-size:11px;color:var(--muted);margin-top:2px">試算量：${calcQty(it.mode,it.n,H,D)}（${esc(H)}人${D>1?"×"+D+"天":""}）</div>`;
+        if(editing){
+          return `<tr>
+            <td>${esc(it.name)}</td>
+            <td><select data-tplmode="${i}" style="font-size:12px;padding:4px">${QTY_MODES.map(m=>`<option value="${m.v}" ${it.mode===m.v?"selected":""}>${m.l}</option>`).join("")}</select>
+              <input class="qty-inp" data-tpln="${i}" value="${esc(it.n||1)}" title="${md&&md.nLabel?esc(md.nLabel):""}" style="width:56px;${showN?"":"display:none"}">
+              ${showN&&md&&md.nLabel?`<span style="font-size:11px;color:var(--muted)">${esc(md.nLabel)}</span>`:""}${qtyNote}</td>
+            <td class="num"><input class="price-inp" data-tplprice="${i}" value="${esc(it.unitPrice)}"></td>
+            <td><button class="lineDel" data-tpldel="${i}" title="移除">×</button></td>
+          </tr>`;
+        }
+        return `<tr>
+          <td>${esc(it.name)}</td>
+          <td>${esc(modeLabel(it.mode,it.n))}${qtyNote}</td>
+          <td class="num">${nf(it.unitPrice)}</td>
+          <td></td>
+        </tr>`;
+      }).join("");
       const otherTours=prods.filter(p=>p.id!==tplTour);
       const dupOpts=otherTours.map(p=>`<option value="${esc(p.id)}">${esc(p.name)}${TEMPLATES[p.id]&&TEMPLATES[p.id].items&&TEMPLATES[p.id].items.length?"（已有範本，會覆蓋）":""}</option>`).join("");
+      // 版本資訊列
+      const metaLine = official.rev ? `<div style="font-size:11.5px;color:var(--muted);margin-top:3px">目前第 <b>${official.rev}</b> 版　·　最後修改：${esc(official.updatedBy||"—")}　${fmtTime(official.updatedAt)}${official.changeSummary?`　·　${esc(official.changeSummary)}`:""}</div>` : "";
+      // 版本歷史
+      const hist = official.history||[];
+      const histRows = hist.map(h=>`<tr>
+        <td style="white-space:nowrap">第 ${h.rev||"?"} 版</td>
+        <td style="white-space:nowrap">${esc(h.by||"—")}</td>
+        <td style="white-space:nowrap">${fmtTime(h.at)}</td>
+        <td>${esc(h.summary||"")}${h.note?`<div style="color:var(--muted)">備註：${esc(h.note)}</div>`:""}</td>
+        <td style="white-space:nowrap"><button class="btn ghost sm" data-tplrestore="${h.rev}" ${editing?"disabled":""}>還原此版</button></td>
+      </tr>`).join("");
+      const histBlock = hist.length ? `<div style="margin-top:16px;border-top:1px solid var(--line);padding-top:12px">
+        <button class="btn ghost sm" id="tpl_histtoggle">${tplHistOpen?"▾":"▸"} 版本歷史（${hist.length}）</button>
+        ${tplHistOpen?`<div style="overflow:auto;margin-top:10px"><table style="font-size:12.5px">
+          <thead><tr><th>版本</th><th>修改者</th><th>時間</th><th>改了什麼</th><th></th></tr></thead>
+          <tbody>${histRows}</tbody></table></div>`:""}
+      </div>` : "";
+
+      const headerNote = official.conflictOf
+        ? `⚠️ 這是<b>衝突副本</b>（有人同時改了同一條範本，系統把你的版本另存於此）。核對後可用「複製這份範本到」貼回正本行程，再刪掉此副本。`
+        : (editing ? `✏️ <b>編輯中（建立新版本）</b>：改完按「儲存為新版本」會產生一個新版本、舊版自動進歷史；按取消則不留版本。`
+                   : `這是目前正式版本，<b>唯讀</b>。要修改請按「修改（建立新版本）」；所有變更都會記錄日期與修改者。`);
+
+      // 動作按鈕
+      const actions = editing
+        ? `<button class="btn" id="tpl_savever">✓ 儲存為新版本</button> <button class="btn ghost" id="tpl_canceledit">取消</button>`
+        : `<button class="btn" id="tpl_beginedit">✏️ 修改（建立新版本）</button> <button class="btn ghost sm" data-tplback>← 回總覽</button>`;
+
       body=`<div class="card" style="padding:18px;margin-top:14px">
         <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap">
-          <div><h3 style="margin:0 0 4px">${esc(tour.name||tpl.name||tplTour)}</h3>
-          <div style="font-size:12.5px;color:var(--muted)">${tpl.conflictOf?`⚠️ 這是<b>衝突副本</b>（有人同時改了同一條範本，系統把你的版本另存於此）。核對後可用下方「複製這份範本到」貼回正本行程，再到總覽刪掉此副本。`:`設定此行程實際包含的成本元件與數量規則。之後在報價加入這條行程，就會帶入這份成本（取代通用範本）。`}</div></div>
-          <button class="btn ghost sm" data-tplback>← 回範本總覽</button>
+          <div style="flex:1;min-width:240px"><h3 style="margin:0 0 4px">${esc(tour.name||official.name||tplTour)}</h3>
+          <div style="font-size:12.5px;color:var(--muted)">${headerNote}</div>${metaLine}</div>
+          <div style="white-space:nowrap">${actions}</div>
         </div>
-        ${items.length?`<div style="overflow:auto"><table>
+        ${items.length?`<div style="overflow:auto;margin-top:12px"><table>
           <thead><tr><th>元件</th><th>數量規則</th><th class="num">單價(成本)</th><th></th></tr></thead>
           <tbody>${rows}</tbody></table></div>
-          <div style="text-align:right;font-size:12.5px;color:var(--muted);margin-top:6px">此範本試算成本（${esc(H)}人${D>1?"×"+D+"天":""}）：<b style="color:var(--ink,#111)">${nf(tplCost)}</b></div>`:`<div style="color:var(--muted);font-size:13px;padding:8px 0">尚未加入元件。用下方關鍵字搜尋元件加入。</div>`}
-        <div style="margin-top:16px;border-top:1px solid var(--line);padding-top:14px">
+          <div style="text-align:right;font-size:12.5px;color:var(--muted);margin-top:6px">試算成本（${esc(H)}人${D>1?"×"+D+"天":""}）：<b style="color:var(--ink,#111)">${nf(tplCost)}</b></div>`:`<div style="color:var(--muted);font-size:13px;padding:8px 0">${editing?"尚未加入元件。用下方關鍵字搜尋元件加入。":"這份範本沒有元件。"}</div>`}
+        ${editing?`<div style="margin-top:16px;border-top:1px solid var(--line);padding-top:14px">
           <label class="bfld" style="max-width:420px"><span>加入元件（關鍵字）</span><input class="inp" id="tpl_kw" value="${esc(tplKw)}" placeholder="例：導覽員、便當、43座大巴、保險、住宿"></label>
           <div class="chips" id="tplPickList">${tplPickList()}</div>
-        </div>
-        ${items.length?`<div style="margin-top:16px;border-top:1px solid var(--line);padding-top:14px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:12.5px">
+          <label class="bfld" style="max-width:560px;margin-top:12px"><span>這次改了什麼（可留空，系統會自動記錄差異）</span><input class="inp" id="tpl_note" placeholder="例：暑假漲價、改用大巴"></label>
+        </div>`:""}
+        ${(!editing && items.length)?`<div style="margin-top:16px;border-top:1px solid var(--line);padding-top:14px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:12.5px">
           <span style="color:var(--muted)">複製這份範本到：</span>
           <select id="tpl_dupto" class="inp" style="max-width:300px;font-size:12px">${dupOpts}</select>
           <button class="btn ghost sm" id="tpl_dupbtn">複製過去</button>
           <span style="flex:1"></span>
-          <button class="btn ghost sm" id="tpl_wipe" style="color:var(--danger)">清空此範本</button>
+          <button class="btn ghost sm" id="tpl_wipe" style="color:var(--danger)">刪除整份範本</button>
         </div>`:""}
+        ${editing?"":histBlock}
       </div>`;
     }
     const overview = tplTour ? "" : tplOverview(prods);
+    const userChip = cloudEnabled() ? (isLoggedIn()
+      ? `<span class="tag" style="background:#ecfdf5;color:#065f46">👤 ${esc(meName())}${isAdmin()?"（管理員）":""}</span><button class="btn ghost sm" id="tpl_logout">登出</button>`
+      : `<button class="btn ghost sm" id="tpl_login">🔑 登入以修改範本</button>`) : "";
     const syncBar = `<div style="display:flex;align-items:center;gap:10px;margin:0 0 12px;flex-wrap:wrap">
       ${syncBadgeHTML()}
-      ${cloudEnabled()?`<button class="btn ghost sm" id="tpl_pull">↻ 重新從雲端載入</button><span style="color:var(--muted);font-size:11.5px">範本全業務共用，存在 Google 雲端；變更會自動同步。</span>`:`<span style="color:var(--muted);font-size:11.5px">目前是試用版（單機）；部署版會自動同步到雲端、全業務共用。</span>`}
-    </div>`;
+      ${cloudEnabled()?`<button class="btn ghost sm" id="tpl_pull">↻ 重新從雲端載入</button>`:""}
+      ${userChip}
+      <span style="flex:1"></span>
+      ${(isAdmin()&&SRV.passwordLogin)?`<button class="btn ghost sm" id="tpl_users">👥 帳號管理</button>`:""}
+    </div>
+    <div style="font-size:11.5px;color:var(--muted);margin:-6px 0 12px">${cloudEnabled()?"範本全業務共用、存在 Google 雲端。<b>看／用免登入</b>；要修改、刪除範本需登入，系統會記錄日期與修改者。":"目前是試用版（單機）；部署版會自動同步到雲端、全業務共用。"}</div>`;
     return `<div class="hint info">📐 為每條主行程設定它「實際包含哪些成本元件、各多少」。設定後，報價加入這條行程時就帶入<b>它專屬的成本</b>（不再用通用範本），試算更準。建議先設你們最常賣的幾條。</div>
       ${syncBar}
       <label class="bfld" style="max-width:560px"><span>選擇要設定的主行程</span><select class="inp" id="tpl_tour"><option value="">— 請選擇主行程 —</option>${opts}</select></label>
@@ -659,8 +879,16 @@
   }
   // 範本總覽：列出所有已設定專屬範本的行程，可一眼看數量/試算成本，並編輯或刪除
   function tplOverview(prods){
-    const ids=Object.keys(TEMPLATES).filter(id=>TEMPLATES[id]&&TEMPLATES[id].items&&TEMPLATES[id].items.length);
-    if(!ids.length) return `<div class="card empty" style="margin-top:14px"><div class="big">📐</div><div>還沒有任何專屬範本</div><div style="margin-top:8px;color:var(--muted);font-size:12.5px">從上方選一條主行程，把它常用的成本元件加進去。其餘行程在報價時會先用「通用範本」粗估。</div></div>`;
+    const ids=Object.keys(TEMPLATES).filter(id=>{ const t=TEMPLATES[id]; return t&&t.items&&t.items.length&&!t.archived&&!t._pendingDel; });
+    const delIds=Object.keys(TEMPLATES).filter(id=>TEMPLATES[id]&&(TEMPLATES[id].archived||TEMPLATES[id]._pendingDel));
+    const deletedBlock = delIds.length ? `<div class="card" style="padding:18px;margin-top:14px">
+      <h3 style="margin:0 0 10px;color:var(--muted)">🗑️ 已刪除範本（${delIds.length}）</h3>
+      <div style="overflow:auto"><table style="font-size:12.5px"><thead><tr><th>主行程</th><th>刪除者</th><th>時間</th><th></th></tr></thead><tbody>${
+        delIds.map(id=>{ const t=TEMPLATES[id]; const name=t.name||(prods.find(p=>p.id===id)||{}).name||id;
+          return `<tr><td>${esc(name)}</td><td>${esc(t.updatedBy||"—")}</td><td>${fmtTime(t.updatedAt)}</td><td style="white-space:nowrap"><button class="btn ghost sm" data-tplrestoredel="${esc(id)}">還原</button></td></tr>`;
+        }).join("")
+      }</tbody></table></div></div>` : "";
+    if(!ids.length) return `<div class="card empty" style="margin-top:14px"><div class="big">📐</div><div>還沒有任何專屬範本</div><div style="margin-top:8px;color:var(--muted);font-size:12.5px">從上方選一條主行程，把它常用的成本元件加進去。其餘行程在報價時會先用「通用範本」粗估。</div></div>${deletedBlock}`;
     const H=quote.headcount||30, D=daysOf(quote.duration);
     // 衝突副本排在最前面，提醒先處理
     ids.sort((a,b)=>(TEMPLATES[b].conflictOf?1:0)-(TEMPLATES[a].conflictOf?1:0));
@@ -686,7 +914,7 @@
       <div style="overflow:auto"><table>
         <thead><tr><th>主行程</th><th class="num">元件數</th><th class="num">試算成本（${esc(H)}人${D>1?"×"+D+"天":""}）</th><th>操作</th></tr></thead>
         <tbody>${rows}</tbody></table></div>
-    </div>`;
+    </div>${deletedBlock}`;
   }
 
   function renderPast(){
@@ -774,36 +1002,71 @@
 
     // 行程成本範本
     const tpull=document.getElementById("tpl_pull"); if(tpull) tpull.onclick=async()=>{ setSync("saving","載入中…"); await cloudPull(); render(); };
-    const tt=document.getElementById("tpl_tour"); if(tt) tt.onchange=()=>{ tplTour=tt.value; tplKw=""; render(); };
+    const tlogin=document.getElementById("tpl_login"); if(tlogin) tlogin.onclick=()=>openLoginModal();
+    const tlogout=document.getElementById("tpl_logout"); if(tlogout) tlogout.onclick=()=>logout();
+    const tusers=document.getElementById("tpl_users"); if(tusers) tusers.onclick=()=>openUsersModal();
+    const tt=document.getElementById("tpl_tour"); if(tt) tt.onchange=()=>{ const v=tt.value; if(!v){ tplTour=""; tplDraft=null; render(); return; } tplDraft=null; tplHistOpen=false; tplTour=v; tplKw=""; render(); };
     const tkw=document.getElementById("tpl_kw");
     if(tkw){
       let tm; tkw.oninput=()=>{ clearTimeout(tm); tm=setTimeout(()=>{ tplKw=tkw.value; const pl=document.getElementById("tplPickList"); if(pl){ pl.innerHTML=tplPickList(); bindTplAdd(); } },200); };
     }
     bindTplAdd();
-    function ensureTpl(){ if(!TEMPLATES[tplTour]) TEMPLATES[tplTour]={name:(ALL.find(p=>p.id===tplTour)||{}).name||"",items:[]}; return TEMPLATES[tplTour]; }
-    c.querySelectorAll("[data-tplmode]").forEach(el=>el.onchange=()=>{ TEMPLATES[tplTour].items[+el.dataset.tplmode].mode=el.value; saveTpls(tplTour); render(); });
-    c.querySelectorAll("[data-tpln]").forEach(el=>el.onchange=()=>{ TEMPLATES[tplTour].items[+el.dataset.tpln].n=parseFloat(el.value)||1; saveTpls(tplTour); render(); });
-    c.querySelectorAll("[data-tplprice]").forEach(el=>el.onchange=()=>{ TEMPLATES[tplTour].items[+el.dataset.tplprice].unitPrice=parseFloat(el.value)||0; saveTpls(tplTour); });
-    c.querySelectorAll("[data-tpldel]").forEach(el=>el.onclick=()=>{ TEMPLATES[tplTour].items.splice(+el.dataset.tpldel,1); saveTpls(tplTour); render(); });
-    // 總覽：編輯 / 刪除整份
-    c.querySelectorAll("[data-tpledit]").forEach(el=>el.onclick=()=>{ tplTour=el.dataset.tpledit; tplKw=""; render(); });
-    c.querySelectorAll("[data-tplwipe]").forEach(el=>el.onclick=()=>{ const id=el.dataset.tplwipe; const nm=(TEMPLATES[id]&&TEMPLATES[id].name)||id; if(confirm(`刪除「${nm}」的整份成本範本？此行程之後報價會改用通用範本。`)){ delTpl(id); render(); toast("已刪除範本"); } });
-    // 編輯卡：回總覽 / 清空 / 複製到另一條行程
-    const tback=c.querySelector("[data-tplback]"); if(tback) tback.onclick=()=>{ tplTour=""; render(); };
-    const twipe=document.getElementById("tpl_wipe"); if(twipe) twipe.onclick=()=>{ if(confirm("清空此行程的所有範本元件？")){ delTpl(tplTour); tplTour=""; render(); toast("已清空"); } };
-    const tdup=document.getElementById("tpl_dupbtn"); if(tdup) tdup.onclick=()=>{
+    // 進/出「建立新版本」編輯模式（草稿在記憶體，改完一次存成一個版本）
+    const tbegin=document.getElementById("tpl_beginedit"); if(tbegin) tbegin.onclick=()=>requireLogin(()=>{
+      const o=TEMPLATES[tplTour]||{items:[]};
+      tplDraft={id:tplTour, name:o.name||(ALL.find(p=>p.id===tplTour)||{}).name||"", items:(o.items||[]).map(it=>Object.assign({},it))};
+      render();
+    });
+    const tcancel=document.getElementById("tpl_canceledit"); if(tcancel) tcancel.onclick=()=>{ tplDraft=null; render(); };
+    const tsave=document.getElementById("tpl_savever"); if(tsave) tsave.onclick=()=>{
+      if(!tplDraft) return;
+      const o=TEMPLATES[tplTour]||{};
+      const note=(document.getElementById("tpl_note")||{}).value||"";
+      tplNotes[tplTour]=note.trim();
+      const keep={name:tplDraft.name, items:tplDraft.items.map(it=>Object.assign({},it)), rev:o.rev||0};
+      if(o.conflictOf) keep.conflictOf=o.conflictOf;
+      TEMPLATES[tplTour]=keep;
+      tplDraft=null;
+      saveTpls(tplTour);   // 一次送出＝一個新版本
+      render(); toast("已儲存為新版本");
+    };
+    const thist=document.getElementById("tpl_histtoggle"); if(thist) thist.onclick=()=>{ tplHistOpen=!tplHistOpen; render(); };
+    c.querySelectorAll("[data-tplrestore]").forEach(el=>el.onclick=()=>{
+      const rv=+el.dataset.tplrestore; const o=TEMPLATES[tplTour]||{}; const h=(o.history||[]).find(x=>x.rev===rv);
+      if(!h) return;
+      requireLogin(()=>{ if(!confirm(`還原成第 ${rv} 版？會以此版內容建立一個新版本（目前版本仍會留在歷史）。`)) return;
+        tplNotes[tplTour]=`還原自第 ${rv} 版`;
+        const keep={name:h.name||o.name, items:(h.items||[]).map(it=>Object.assign({},it)), rev:o.rev||0};
+        if(o.conflictOf) keep.conflictOf=o.conflictOf;
+        TEMPLATES[tplTour]=keep; saveTpls(tplTour); render(); toast("已還原第 "+rv+" 版");
+      });
+    });
+    // 編輯草稿內的列操作（只動草稿、不即時同步；儲存才成版本）
+    c.querySelectorAll("[data-tplmode]").forEach(el=>el.onchange=()=>{ if(!tplDraft) return; tplDraft.items[+el.dataset.tplmode].mode=el.value; render(); });
+    c.querySelectorAll("[data-tpln]").forEach(el=>el.onchange=()=>{ if(!tplDraft) return; tplDraft.items[+el.dataset.tpln].n=parseFloat(el.value)||1; });
+    c.querySelectorAll("[data-tplprice]").forEach(el=>el.onchange=()=>{ if(!tplDraft) return; tplDraft.items[+el.dataset.tplprice].unitPrice=parseFloat(el.value)||0; });
+    c.querySelectorAll("[data-tpldel]").forEach(el=>el.onclick=()=>{ if(!tplDraft) return; tplDraft.items.splice(+el.dataset.tpldel,1); render(); });
+    // 總覽：編輯（檢視）/ 刪除整份 / 還原已刪除
+    c.querySelectorAll("[data-tpledit]").forEach(el=>el.onclick=()=>{ tplTour=el.dataset.tpledit; tplDraft=null; tplHistOpen=false; tplKw=""; render(); });
+    c.querySelectorAll("[data-tplwipe]").forEach(el=>el.onclick=()=>{ const id=el.dataset.tplwipe; const nm=(TEMPLATES[id]&&TEMPLATES[id].name)||id; requireLogin(()=>{ if(confirm(`刪除「${nm}」的整份成本範本？會移到「已刪除」可還原，並記錄是誰刪的。`)){ delTpl(id); render(); toast("已刪除範本"); } }); });
+    c.querySelectorAll("[data-tplrestoredel]").forEach(el=>el.onclick=()=>restoreTpl(el.dataset.tplrestoredel));
+    // 編輯卡：回總覽 / 刪除 / 複製到另一條行程
+    const tback=c.querySelector("[data-tplback]"); if(tback) tback.onclick=()=>{ tplTour=""; tplDraft=null; render(); };
+    const twipe=document.getElementById("tpl_wipe"); if(twipe) twipe.onclick=()=>requireLogin(()=>{ if(confirm("刪除此範本？會移到「已刪除」可還原，並記錄是誰刪的。")){ delTpl(tplTour); tplTour=""; render(); toast("已刪除範本"); } });
+    const tdup=document.getElementById("tpl_dupbtn"); if(tdup) tdup.onclick=()=>requireLogin(()=>{
       const sel=document.getElementById("tpl_dupto"); const dst=sel&&sel.value; if(!dst) return;
       const src=TEMPLATES[tplTour]; if(!src||!src.items||!src.items.length){ toast("這份範本是空的"); return; }
       const dstName=(ALL.find(p=>p.id===dst)||{}).name||dst;
       if(TEMPLATES[dst]&&TEMPLATES[dst].items&&TEMPLATES[dst].items.length && !confirm(`「${dstName}」已有範本，確定覆蓋？`)) return;
+      tplNotes[dst]=`從「${(ALL.find(p=>p.id===tplTour)||{}).name||tplTour}」複製`;
       TEMPLATES[dst]={name:dstName, items:src.items.map(it=>Object.assign({},it)), rev:(TEMPLATES[dst]&&TEMPLATES[dst].rev)||0};
-      saveTpls(dst); tplTour=dst; tplKw=""; render(); toast("已複製到："+dstName);
-    };
+      saveTpls(dst); tplTour=dst; tplDraft=null; tplKw=""; render(); toast("已複製到："+dstName);
+    });
     function bindTplAdd(){
       document.querySelectorAll("[data-tpladd]").forEach(el=>el.onclick=()=>{
+        if(!tplDraft) return;
         const m=ALL.find(x=>x.id===el.dataset.tpladd); if(!m) return;
-        const t=ensureTpl();
-        if(t.items.some(it=>it.id===m.id)){ toast("已在範本中"); return; }
+        if(tplDraft.items.some(it=>it.id===m.id)){ toast("已在範本中"); return; }
         // 依元件名稱猜一個合理的數量規則與 N（業務可再改）
         let mode="fixed", n=1;
         if(/帶路人|導覽員|人力/.test(m.name)){ mode="perGroup"; n=25; }
@@ -811,8 +1074,8 @@
         else if(/中巴|小巴/.test(m.name)){ mode="perGroup"; n=20; }
         else if(/巴士/.test(m.name)){ mode="perGroup"; n=43; }
         else if(/保險|便當|餐|門票|體驗/.test(m.name)||m.unit==="人"){ mode="perPerson"; }
-        t.items.push({id:m.id,name:m.name,unit:m.unit||"項",unitPrice:m.unitPrice||0,mode,n});
-        saveTpls(tplTour); render(); toast("已加入範本："+m.name);
+        tplDraft.items.push({id:m.id,name:m.name,unit:m.unit||"項",unitPrice:m.unitPrice||0,mode,n});
+        render(); toast("已加入："+m.name);
       });
     }
   }
@@ -865,8 +1128,8 @@
 
   // ---- 回存 Drive / Zoho（需經部署版後端）----
   async function postJSON(path, payload){
-    const r = await fetch(API_BASE + path, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(payload)});
-    if(!r.ok) throw new Error("HTTP "+r.status);
+    const r = await fetch(API_BASE + path, {method:"POST", headers:Object.assign({"Content-Type":"application/json"},authHeader()), body:JSON.stringify(payload)});
+    if(!r.ok){ const err=new Error("HTTP "+r.status); err.status=r.status; try{ err.data=await r.json(); }catch(e){} throw err; }
     return r.json();
   }
   function resultsToast(res){
@@ -915,5 +1178,7 @@
   if(fbBtn) fbBtn.onclick=openFeedback;
 
   render();
-  cloudPull();   // 部署版：開啟時先把雲端共用範本拉下來（試用版會自動略過）
+  loadServerConfig().then(()=>{ if(view==="template") render(); });  // 取得登入設定（Google/密碼）後重繪
+  cloudPull();      // 部署版：開啟時先把雲端共用範本拉下來（試用版會自動略過）
+  validateSession(); // 確認本機保存的登入是否仍有效（過期就清掉）
 })();
