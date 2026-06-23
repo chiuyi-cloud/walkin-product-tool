@@ -608,14 +608,91 @@ def apply_template_ops(ops, editor=None):
         return {"ok": bool(res.get("ok")), "templates": cur, "conflicts": conflicts, "results": [res]}
 
 
-class Handler(BaseHTTPRequestHandler):
-    server_version = "WalkinProductTool/0.2"
+LOGIN_PAGE = """<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>登入｜島內散步 產品與報價工具</title>
+<style>
+ body{margin:0;font-family:-apple-system,"PingFang TC","Microsoft JhengHei",sans-serif;background:#f6f7f9;color:#1f2937;display:flex;min-height:100vh;align-items:center;justify-content:center}
+ .card{background:#fff;border-radius:14px;box-shadow:0 12px 40px rgba(0,0,0,.12);padding:36px 32px;width:380px;max-width:92vw;text-align:center}
+ h1{font-size:19px;margin:0 0 6px}
+ .sub{font-size:13px;color:#6b7280;margin-bottom:24px;line-height:1.7}
+ #gbtn{display:flex;justify-content:center;min-height:44px}
+ #err{color:#dc2626;font-size:12.5px;min-height:18px;margin-top:14px}
+ .brand{font-weight:700;color:#b45309}
+</style></head>
+<body><div class="card">
+ <h1>島內散步｜產品與報價工具</h1>
+ <div class="sub">請用你的 <span class="brand" id="dom">@walkin.tw</span> 公司 Google 帳號登入。<br>此工具僅限公司同仁使用。</div>
+ <div id="gbtn"></div>
+ <div id="pwbox" style="display:none;text-align:left;margin-top:6px">
+   <input id="pw_u" placeholder="帳號" autocomplete="username" style="width:100%;box-sizing:border-box;padding:9px;margin:6px 0;border:1px solid #d1d5db;border-radius:8px">
+   <input id="pw_p" type="password" placeholder="密碼" autocomplete="current-password" style="width:100%;box-sizing:border-box;padding:9px;margin:6px 0;border:1px solid #d1d5db;border-radius:8px">
+   <button id="pw_btn" style="width:100%;padding:10px;border:0;border-radius:8px;background:#b45309;color:#fff;font-size:14px;cursor:pointer">登入</button>
+ </div>
+ <div id="err"></div>
+</div>
+<script src="https://accounts.google.com/gsi/client" async defer></script>
+<script>
+(async function(){
+ var cfg={};
+ try{ cfg=((await (await fetch("/api/health")).json())||{}).configured||{}; }catch(e){}
+ if(cfg.domain) document.getElementById("dom").textContent="@"+cfg.domain;
+ var err=document.getElementById("err");
+ if(cfg.googleClientId){
+  function ready(cb){ if(window.google&&google.accounts&&google.accounts.id) cb(); else setTimeout(function(){ready(cb);},150); }
+  ready(function(){
+   google.accounts.id.initialize({ client_id:cfg.googleClientId, hd:cfg.domain||undefined, callback:async function(resp){
+    err.textContent="登入中…";
+    try{
+     var r=await fetch("/api/login-google",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({credential:resp.credential})});
+     var d=await r.json();
+     if(r.ok&&d.ok){ location.replace("/"); } else { err.textContent=(d&&d.reason)||("登入失敗 "+r.status); }
+    }catch(e){ err.textContent="登入失敗，請重試"; }
+   }});
+   google.accounts.id.renderButton(document.getElementById("gbtn"),{theme:"outline",size:"large",width:300,text:"signin_with"});
+  });
+ } else if(cfg.passwordLogin){
+  document.getElementById("pwbox").style.display="block";
+  document.getElementById("pw_btn").onclick=async function(){
+   err.textContent="登入中…";
+   try{
+    var r=await fetch("/api/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({username:document.getElementById("pw_u").value.trim(),password:document.getElementById("pw_p").value})});
+    var d=await r.json();
+    if(r.ok&&d.ok){ location.replace("/"); } else { err.textContent=(d&&d.reason)||("登入失敗 "+r.status); }
+   }catch(e){ err.textContent="登入失敗，請重試"; }
+  };
+ } else {
+  err.textContent="後端尚未設定登入方式（GOOGLE_OAUTH_CLIENT_ID）";
+ }
+})();
+</script></body></html>"""
 
-    def _json(self, obj, status=200):
+
+def _health_obj():
+    return {"ok": True, "configured": {
+        "google": google_configured(),
+        "zoho": bool(os.environ.get("ZOHO_REFRESH_TOKEN")),
+        "indexSheet": bool(os.environ.get("INDEX_SHEET_ID")),
+        "templates": bool(_template_folder() or os.environ.get("GDRIVE_TEMPLATE_FILE_ID")),
+        "login": True,
+        "googleClientId": GOOGLE_OAUTH_CLIENT_ID or "",
+        "passwordLogin": ALLOW_PASSWORD_LOGIN,
+        "domain": ALLOWED_DOMAIN,
+    }}
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "WalkinProductTool/0.3"
+
+    def _json(self, obj, status=200, set_cookie=None, clear_cookie=False):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        if set_cookie is not None:
+            self.send_header("Set-Cookie", self._session_cookie(set_cookie))
+        if clear_cookie:
+            self.send_header("Set-Cookie", "walkin_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax")
         self._cors(); self.end_headers(); self.wfile.write(body)
 
     def _cors(self):
@@ -623,33 +700,46 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
 
-    def _auth_ok(self):
-        if not AUTH_ENABLED:
+    # ---- 登入通行證（cookie）：整站都要驗 ----
+    def _is_https(self):
+        if self.headers.get("X-Forwarded-Proto", "").lower() == "https":
             return True
-        h = self.headers.get("Authorization", "")
-        if h.startswith("Basic "):
-            try:
-                u, _, p = base64.b64decode(h[6:]).decode("utf-8").partition(":")
-                return hmac.compare_digest(u, AUTH_USER) and hmac.compare_digest(p, AUTH_PASS)
-            except Exception:
-                return False
-        return False
+        host = self.headers.get("Host", "")
+        return "railway.app" in host or host.endswith(":443")
 
-    def _need_auth(self):
-        self.send_response(401)
-        self.send_header("WWW-Authenticate", 'Basic realm="Walkin Product Tool"')
-        self._cors(); self.send_header("Content-Length", "0"); self.end_headers()
+    def _session_cookie(self, token):
+        sec = "; Secure" if self._is_https() else ""
+        return "walkin_session=" + token + "; Path=/; HttpOnly; SameSite=Lax; Max-Age=" + str(SESSION_TTL) + sec
+
+    def _cookies(self):
+        out = {}
+        for part in self.headers.get("Cookie", "").split(";"):
+            if "=" in part:
+                k, v = part.strip().split("=", 1)
+                out[k.strip()] = v.strip()
+        return out
+
+    def _session_user(self):
+        tok = self._cookies().get("walkin_session")
+        u = verify_token(tok) if tok else None
+        if u:
+            return u
+        h = self.headers.get("Authorization", "")   # 後援：給 curl/非瀏覽器測試
+        if h.startswith("Bearer "):
+            return verify_token(h[7:].strip())
+        return None
 
     def _body(self):
         n = int(self.headers.get("Content-Length", 0))
         return json.loads(self.rfile.read(n).decode("utf-8")) if n else {}
 
-    def _bearer_user(self):
-        """從 Authorization: Bearer <token> 取得已登入身分；無效回 None。"""
-        h = self.headers.get("Authorization", "")
-        if h.startswith("Bearer "):
-            return verify_token(h[7:].strip())
-        return None
+    def _serve_login_page(self):
+        body = LOGIN_PAGE.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers(); self.wfile.write(body)
 
     def _static(self, path):
         entry = STATIC_FILES.get(path)
@@ -671,36 +761,29 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(204); self._cors(); self.end_headers()
 
     def do_GET(self):
-        if not self._auth_ok():
-            return self._need_auth()
         path = urlparse(self.path).path
         if path == "/api/health":
-            return self._json({"ok": True, "configured": {
-                "google": google_configured(),
-                "zoho": bool(os.environ.get("ZOHO_REFRESH_TOKEN")),
-                "indexSheet": bool(os.environ.get("INDEX_SHEET_ID")),
-                "templates": bool(_template_folder() or os.environ.get("GDRIVE_TEMPLATE_FILE_ID")),
-                "login": True,
-                "googleClientId": GOOGLE_OAUTH_CLIENT_ID or "",
-                "passwordLogin": ALLOW_PASSWORD_LOGIN,
-                "domain": ALLOWED_DOMAIN,
-            }})
-        if path == "/api/templates":
-            return self._json(read_templates())   # 看／用範本不需登入
+            return self._json(_health_obj())
+        user = self._session_user()
+        if not user:
+            # 未登入：首頁給登入頁；其餘一律擋（保護 app.js / products.js / proposals.js 等）
+            if path in ("/", "/index.html"):
+                return self._serve_login_page()
+            if path == "/api/me":
+                return self._json({"ok": False, "user": None})
+            return self._json({"ok": False, "needLogin": True, "error": "login required"}, 401)
+        # 已登入
         if path == "/api/me":
-            u = self._bearer_user()
-            return self._json({"ok": bool(u), "user": _public_user(u) if u else None})
+            return self._json({"ok": True, "user": _public_user(user)})
+        if path == "/api/templates":
+            return self._json(read_templates())
         if path == "/api/users":
-            u = self._bearer_user()
-            if not u or u.get("role") != "admin":
+            if user.get("role") != "admin":
                 return self._json({"ok": False, "reason": "需要管理員"}, 403)
-            users = [_public_user(x) for x in read_users().get("users", [])]
-            return self._json({"ok": True, "users": users})
+            return self._json({"ok": True, "users": [_public_user(x) for x in read_users().get("users", [])]})
         return self._static(path)
 
     def do_POST(self):
-        if not self._auth_ok():
-            return self._need_auth()
         path = urlparse(self.path).path
         try:
             if path == "/api/login-google":
@@ -711,20 +794,25 @@ class Handler(BaseHTTPRequestHandler):
                     u = verify_google_credential(b.get("credential"))
                 except Exception as e:
                     return self._json({"ok": False, "reason": str(e)[:140] or "Google 登入驗證失敗"}, 401)
-                return self._json({"ok": True, "token": issue_token(u["u"], u["name"], u["role"]),
-                                   "user": _public_user(u)})
-            if path == "/api/login":
+                return self._json({"ok": True, "user": _public_user(u)},
+                                  set_cookie=issue_token(u["u"], u["name"], u["role"]))
+            if path == "/api/login":   # 密碼登入（預設停用；本機/救生艇）
                 if not ALLOW_PASSWORD_LOGIN:
                     return self._json({"ok": False, "reason": "已停用密碼登入，請改用公司 Google 帳號登入"}, 403)
                 b = self._body()
                 u = authenticate(b.get("username"), b.get("password"))
                 if not u:
                     return self._json({"ok": False, "reason": "帳號或密碼錯誤"}, 401)
-                return self._json({"ok": True, "token": issue_token(u["u"], u["name"], u["role"]),
-                                   "user": _public_user(u)})
-            if path == "/api/users":   # 管理員建立帳號（密碼登入模式才有意義）
-                actor = self._bearer_user()
-                if not actor or actor.get("role") != "admin":
+                return self._json({"ok": True, "user": _public_user(u)},
+                                  set_cookie=issue_token(u["u"], u["name"], u["role"]))
+            if path == "/api/logout":
+                return self._json({"ok": True}, clear_cookie=True)
+            # 以下都需登入（通行證 cookie）
+            user = self._session_user()
+            if not user:
+                return self._json({"ok": False, "needLogin": True, "reason": "請先登入"}, 401)
+            if path == "/api/users":
+                if user.get("role") != "admin":
                     return self._json({"ok": False, "reason": "需要管理員權限"}, 403)
                 b = self._body()
                 return self._json(create_user(b.get("username"), b.get("name"),
@@ -732,26 +820,18 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/save-quote":
                 q = self._body()
                 fn = save_submission("quote", q)
-                results = [write_quote_to_gsheet(q), write_quote_to_zoho(q)]
-                return self._json({"saved": fn, "results": results})
+                return self._json({"saved": fn, "results": [write_quote_to_gsheet(q), write_quote_to_zoho(q)]})
             if path == "/api/save-proposal":
                 p = self._body()
                 fn = save_submission("proposal", p)
                 drive = write_proposal_to_drive(p)
-                idx = append_index_row(p, drive.get("url"))
-                return self._json({"saved": fn, "results": [drive, idx]})
+                return self._json({"saved": fn, "results": [drive, append_index_row(p, drive.get("url"))]})
             if path == "/api/templates":
-                # 改範本需登入：身分由 token 認定，不靠前端自報
-                actor = self._bearer_user()
-                if not actor:
-                    return self._json({"ok": False, "reason": "請先登入再修改範本", "needLogin": True}, 401)
                 body = self._body()
                 if isinstance(body, dict) and isinstance(body.get("ops"), list):
-                    return self._json(apply_template_ops(body["ops"], actor))
-                # 相容舊版：整包覆蓋
+                    return self._json(apply_template_ops(body["ops"], user))
                 tpls = body.get("templates", body) if isinstance(body, dict) else {}
-                res = write_templates(tpls)
-                return self._json({"results": [res]})
+                return self._json({"results": [write_templates(tpls)]})
         except Exception as e:
             return self._json({"error": str(e)}, 400)
         return self._json({"error": "unknown endpoint"}, 404)

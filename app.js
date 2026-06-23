@@ -93,7 +93,7 @@
     }catch(e){
       // 失敗：把這批標記放回去，下次重送，避免漏存
       sentDirty.forEach(id=>tplDirty.add(id)); sentDeleted.forEach(id=>tplDeleted.add(id));
-      if(e&&e.status===401){ setAuth(null); setSync("error","登入已過期，請重新登入後再存"); requireLogin(()=>cloudPush()); }
+      if(e&&e.status===401){ setSync("error","登入已過期，請重新登入"); gotoLogin(); }
       else setSync("error","雲端同步失敗（後端未啟動？）");
     }
   }
@@ -116,114 +116,37 @@
         const res=await postJSON("/api/templates",{ops:[{op:"restore", id, baseRev:(TEMPLATES[id]&&TEMPLATES[id].rev)||0}]});
         if(res.templates){ TEMPLATES=res.templates; saveTplsLocal(); }
         setSync("saved","已還原 "+hm()); render(); toast("已還原範本");
-      }catch(e){ if(e&&e.status===401){ setAuth(null); requireLogin(()=>restoreTpl(id)); } else setSync("error","還原失敗"); }
+      }catch(e){ if(e&&e.status===401){ gotoLogin(); } else setSync("error","還原失敗"); }
     });
   }
 
-  // ---- 個人登入（看/用範本免登入；改範本才要登入）----
-  const AUTH_LS="walkin_auth_v1";
-  function loadAuth(){ try{ return JSON.parse(localStorage.getItem(AUTH_LS))||null; }catch(e){ return null; } }
-  let AUTH=loadAuth();
-  let SRV={googleClientId:"",passwordLogin:false,domain:"walkin.tw"};   // 後端登入設定
-  function isLoggedIn(){ return !!(AUTH&&AUTH.token); }
-  function isAdmin(){ return isLoggedIn() && AUTH.user && AUTH.user.role==="admin"; }
+  // ---- 個人登入（整站需登入；登入頁由後端提供，這裡只認身分）----
+  // 通行證是 HttpOnly cookie，由瀏覽器自動帶；前端只記住「我是誰」
+  let AUTH=null;   // {user:{u,name,role}} 或 null
+  let SRV={googleClientId:"",passwordLogin:false,domain:"walkin.tw"};
+  function isLoggedIn(){ return !!(AUTH&&AUTH.user); }
+  function isAdmin(){ return isLoggedIn() && AUTH.user.role==="admin"; }
   function meName(){ return (AUTH&&AUTH.user&&AUTH.user.name)||""; }
-  function authHeader(){ return isLoggedIn()?{"Authorization":"Bearer "+AUTH.token}:{}; }
-  function setAuth(a){ AUTH=a; if(a) localStorage.setItem(AUTH_LS,JSON.stringify(a)); else localStorage.removeItem(AUTH_LS); }
   async function loadServerConfig(){
     if(!cloudEnabled()) return;
-    try{ const d=await (await fetch(API_BASE+"/api/health")).json(); const c=(d&&d.configured)||{};
+    try{ const c=(((await (await fetch(API_BASE+"/api/health")).json())||{}).configured)||{};
       SRV.googleClientId=c.googleClientId||""; SRV.passwordLogin=!!c.passwordLogin; SRV.domain=c.domain||"walkin.tw"; }
     catch(e){}
   }
-  // 動態載入 Google Identity Services
-  let _gisP=null;
-  function loadGIS(){
-    if(window.google&&window.google.accounts&&window.google.accounts.id) return Promise.resolve();
-    if(_gisP) return _gisP;
-    _gisP=new Promise((res,rej)=>{ const s=document.createElement("script"); s.src="https://accounts.google.com/gsi/client"; s.async=true; s.defer=true; s.onload=()=>res(); s.onerror=()=>rej(new Error("無法載入 Google 登入元件")); document.head.appendChild(s); });
-    return _gisP;
+  async function loadMe(){
+    if(!cloudEnabled()) return;
+    try{ const d=await (await fetch(API_BASE+"/api/me")).json(); AUTH=d&&d.ok?{user:d.user}:null; }
+    catch(e){ AUTH=null; }
   }
-  async function doGoogleLogin(credential){
-    const r=await fetch(API_BASE+"/api/login-google",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({credential})});
-    const d=await r.json().catch(()=>({}));
-    if(r.ok && d.ok){ setAuth({token:d.token,user:d.user}); return {ok:true,user:d.user}; }
-    return {ok:false,reason:d.reason||("登入失敗 "+r.status)};
+  async function logout(){
+    try{ await fetch(API_BASE+"/api/logout",{method:"POST"}); }catch(e){}
+    location.reload();   // 回到後端登入頁
   }
-  async function doLogin(username,password){
-    const r=await fetch(API_BASE+"/api/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({username,password})});
-    const d=await r.json().catch(()=>({}));
-    if(r.ok && d.ok){ setAuth({token:d.token,user:d.user}); return {ok:true,user:d.user}; }
-    return {ok:false,reason:d.reason||("登入失敗 "+r.status)};
-  }
-  function logout(){ setAuth(null); tplTour=""; toast("已登出"); render(); }
-  async function validateSession(){
-    if(!cloudEnabled() || !isLoggedIn()) return;
-    try{ const r=await fetch(API_BASE+"/api/me",{headers:authHeader()}); const d=await r.json();
-      if(!d.ok){ setAuth(null); if(view==="template") render(); } }
-    catch(e){}
-  }
-  let _afterLogin=null;
-  // 單機試用版（無後端）不需登入；部署版未登入則先跳登入框
-  function requireLogin(cb){ if(!cloudEnabled() || isLoggedIn()){ cb&&cb(); return; } _afterLogin=cb||null; openLoginModal(); }
-  function afterLoginOK(user, close){ const cb=_afterLogin; _afterLogin=null; if(close) close(); toast("已登入："+user.name); render(); cb&&cb(); }
-  function openLoginModal(){
-    if(document.getElementById("loginMask")) return;
-    const mask=document.createElement("div"); mask.id="loginMask";
-    mask.style.cssText="position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:9999";
-    const card=document.createElement("div");
-    card.style.cssText="background:#fff;border-radius:12px;padding:24px;width:360px;max-width:92vw;box-shadow:0 12px 40px rgba(0,0,0,.25)";
-    const close=()=>{ mask.remove(); };
-    if(SRV.googleClientId){
-      // Google 登入（限定公司網域）
-      card.innerHTML=`<h3 style="margin:0 0 4px">登入以修改範本</h3>
-        <div style="font-size:12.5px;color:var(--muted);margin-bottom:16px">請用你的 <b>@${esc(SRV.domain)}</b> 公司 Google 帳號登入。看／用範本不需登入；修改、刪除範本才需要，系統會記錄是誰改的。</div>
-        <div id="gbtn" style="display:flex;justify-content:center;min-height:44px"></div>
-        <div id="lg_err" style="color:var(--danger);font-size:12.5px;min-height:18px;margin-top:10px"></div>
-        <div style="display:flex;justify-content:flex-end;margin-top:6px"><button class="btn ghost" id="lg_cancel">取消</button></div>`;
-      mask.appendChild(card); document.body.appendChild(mask);
-      const err=document.getElementById("lg_err");
-      document.getElementById("lg_cancel").onclick=()=>{ _afterLogin=null; close(); };
-      mask.onclick=(e)=>{ if(e.target===mask){ _afterLogin=null; close(); } };
-      loadGIS().then(()=>{
-        window.google.accounts.id.initialize({ client_id:SRV.googleClientId, hd:SRV.domain, callback:async(resp)=>{
-          err.textContent="登入中…";
-          const res=await doGoogleLogin(resp.credential);
-          if(res.ok) afterLoginOK(res.user, close); else err.textContent=res.reason;
-        }});
-        window.google.accounts.id.renderButton(document.getElementById("gbtn"),{theme:"outline",size:"large",width:300,text:"signin_with"});
-      }).catch(()=>{ err.textContent="無法載入 Google 登入元件（請檢查網路）"; });
-      return;
-    }
-    if(SRV.passwordLogin){
-      // 密碼登入（本機開發／救生艇）
-      card.innerHTML=`<h3 style="margin:0 0 4px">登入以修改範本</h3>
-        <div style="font-size:12.5px;color:var(--muted);margin-bottom:14px">（密碼登入模式）看／用範本不需登入；修改、刪除範本才需要。</div>
-        <label class="bfld"><span>帳號</span><input class="inp" id="lg_u" autocomplete="username"></label>
-        <label class="bfld" style="margin-top:8px"><span>密碼</span><input class="inp" id="lg_p" type="password" autocomplete="current-password"></label>
-        <div id="lg_err" style="color:var(--danger);font-size:12.5px;min-height:18px;margin-top:8px"></div>
-        <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:8px"><button class="btn ghost" id="lg_cancel">取消</button><button class="btn" id="lg_ok">登入</button></div>`;
-      mask.appendChild(card); document.body.appendChild(mask);
-      const u=document.getElementById("lg_u"), p=document.getElementById("lg_p"), err=document.getElementById("lg_err");
-      u.focus();
-      document.getElementById("lg_cancel").onclick=()=>{ _afterLogin=null; close(); };
-      mask.onclick=(e)=>{ if(e.target===mask){ _afterLogin=null; close(); } };
-      const submit=async()=>{ err.textContent=""; const btn=document.getElementById("lg_ok"); btn.disabled=true; btn.textContent="登入中…";
-        const res=await doLogin(u.value.trim(),p.value); btn.disabled=false; btn.textContent="登入";
-        if(res.ok) afterLoginOK(res.user, close); else err.textContent=res.reason; };
-      document.getElementById("lg_ok").onclick=submit;
-      p.onkeydown=(e)=>{ if(e.key==="Enter") submit(); };
-      return;
-    }
-    // 尚未設定任何登入方式
-    card.innerHTML=`<h3 style="margin:0 0 8px">登入尚未設定</h3>
-      <div style="font-size:13px;color:var(--muted);margin-bottom:16px">後端還沒設定 Google 登入。請管理員在伺服器設定 <code>GOOGLE_OAUTH_CLIENT_ID</code> 後即可用公司 @${esc(SRV.domain)} 信箱登入。</div>
-      <div style="text-align:right"><button class="btn" id="lg_cancel">知道了</button></div>`;
-    mask.appendChild(card); document.body.appendChild(mask);
-    document.getElementById("lg_cancel").onclick=()=>{ _afterLogin=null; close(); };
-    mask.onclick=(e)=>{ if(e.target===mask){ _afterLogin=null; close(); } };
-  }
-  // 帳號管理（僅管理員）：列出帳號、新增帳號
+  // session 過期 → 回登入頁
+  function gotoLogin(){ location.reload(); }
+  // 整站已在後端擋登入：app 能載入＝已登入。單機(file://)免登入。
+  function requireLogin(cb){ cb&&cb(); }
+  // 帳號管理（僅密碼登入模式 + 管理員）：列出/新增帳號
   async function openUsersModal(){
     if(!isAdmin()) return;
     if(document.getElementById("usersMask")) return;
@@ -251,11 +174,10 @@
     async function refresh(){
       const box=document.getElementById("us_list");
       try{
-        const r=await fetch(API_BASE+"/api/users",{headers:authHeader()});
-        const d=await r.json();
-        if(!d.ok){ box.textContent="讀取失敗："+(d.reason||r.status); return; }
+        const d=await (await fetch(API_BASE+"/api/users")).json();
+        if(!d.ok){ box.textContent="讀取失敗："+(d.reason||""); return; }
         box.innerHTML=`<table style="width:100%"><thead><tr><th style="text-align:left">帳號</th><th style="text-align:left">名字</th><th style="text-align:left">角色</th></tr></thead><tbody>${
-          d.users.map(u=>`<tr><td>${esc(u.u)}</td><td>${esc(u.name)}</td><td>${u.role==="admin"?"管理員":"業務"}</td></tr>`).join("")||'<tr><td colspan="3">尚無自建帳號（你是內建管理員）</td></tr>'}</tbody></table>`;
+          d.users.map(u=>`<tr><td>${esc(u.u)}</td><td>${esc(u.name)}</td><td>${u.role==="admin"?"管理員":"業務"}</td></tr>`).join("")||'<tr><td colspan="3">尚無自建帳號</td></tr>'}</tbody></table>`;
       }catch(e){ box.textContent="讀取失敗（後端未啟動？）"; }
     }
     refresh();
@@ -268,7 +190,7 @@
         const res=await postJSON("/api/users",{username:u,name:n,password:p,role});
         if(res.ok){ toast("已新增帳號："+(n||u)); document.getElementById("us_u").value="";document.getElementById("us_n").value="";document.getElementById("us_p").value=""; refresh(); }
         else err.textContent=res.reason||"新增失敗";
-      }catch(e){ err.textContent=(e&&e.data&&e.data.reason)||"新增失敗（需管理員或後端未啟動）"; }
+      }catch(e){ err.textContent=(e&&e.data&&e.data.reason)||"新增失敗"; }
     };
   }
 
@@ -861,9 +783,9 @@
       </div>`;
     }
     const overview = tplTour ? "" : tplOverview(prods);
-    const userChip = cloudEnabled() ? (isLoggedIn()
+    const userChip = (cloudEnabled() && isLoggedIn())
       ? `<span class="tag" style="background:#ecfdf5;color:#065f46">👤 ${esc(meName())}${isAdmin()?"（管理員）":""}</span><button class="btn ghost sm" id="tpl_logout">登出</button>`
-      : `<button class="btn ghost sm" id="tpl_login">🔑 登入以修改範本</button>`) : "";
+      : "";
     const syncBar = `<div style="display:flex;align-items:center;gap:10px;margin:0 0 12px;flex-wrap:wrap">
       ${syncBadgeHTML()}
       ${cloudEnabled()?`<button class="btn ghost sm" id="tpl_pull">↻ 重新從雲端載入</button>`:""}
@@ -871,7 +793,7 @@
       <span style="flex:1"></span>
       ${(isAdmin()&&SRV.passwordLogin)?`<button class="btn ghost sm" id="tpl_users">👥 帳號管理</button>`:""}
     </div>
-    <div style="font-size:11.5px;color:var(--muted);margin:-6px 0 12px">${cloudEnabled()?"範本全業務共用、存在 Google 雲端。<b>看／用免登入</b>；要修改、刪除範本需登入，系統會記錄日期與修改者。":"目前是試用版（單機）；部署版會自動同步到雲端、全業務共用。"}</div>`;
+    <div style="font-size:11.5px;color:var(--muted);margin:-6px 0 12px">${cloudEnabled()?"範本全業務共用、存在 Google 雲端；修改／刪除都會記錄日期與修改者。":"目前是試用版（單機）；部署版會用公司 Google 帳號登入、全業務共用。"}</div>`;
     return `<div class="hint info">📐 為每條主行程設定它「實際包含哪些成本元件、各多少」。設定後，報價加入這條行程時就帶入<b>它專屬的成本</b>（不再用通用範本），試算更準。建議先設你們最常賣的幾條。</div>
       ${syncBar}
       <label class="bfld" style="max-width:560px"><span>選擇要設定的主行程</span><select class="inp" id="tpl_tour"><option value="">— 請選擇主行程 —</option>${opts}</select></label>
@@ -1002,7 +924,6 @@
 
     // 行程成本範本
     const tpull=document.getElementById("tpl_pull"); if(tpull) tpull.onclick=async()=>{ setSync("saving","載入中…"); await cloudPull(); render(); };
-    const tlogin=document.getElementById("tpl_login"); if(tlogin) tlogin.onclick=()=>openLoginModal();
     const tlogout=document.getElementById("tpl_logout"); if(tlogout) tlogout.onclick=()=>logout();
     const tusers=document.getElementById("tpl_users"); if(tusers) tusers.onclick=()=>openUsersModal();
     const tt=document.getElementById("tpl_tour"); if(tt) tt.onchange=()=>{ const v=tt.value; if(!v){ tplTour=""; tplDraft=null; render(); return; } tplDraft=null; tplHistOpen=false; tplTour=v; tplKw=""; render(); };
@@ -1128,7 +1049,8 @@
 
   // ---- 回存 Drive / Zoho（需經部署版後端）----
   async function postJSON(path, payload){
-    const r = await fetch(API_BASE + path, {method:"POST", headers:Object.assign({"Content-Type":"application/json"},authHeader()), body:JSON.stringify(payload)});
+    // 通行證是 cookie，瀏覽器自動帶（同源）
+    const r = await fetch(API_BASE + path, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(payload)});
     if(!r.ok){ const err=new Error("HTTP "+r.status); err.status=r.status; try{ err.data=await r.json(); }catch(e){} throw err; }
     return r.json();
   }
@@ -1178,7 +1100,7 @@
   if(fbBtn) fbBtn.onclick=openFeedback;
 
   render();
-  loadServerConfig().then(()=>{ if(view==="template") render(); });  // 取得登入設定（Google/密碼）後重繪
+  // 取得登入身分與設定後重繪（cookie 由瀏覽器自動帶；app 能載入即代表已登入）
+  Promise.all([loadMe(), loadServerConfig()]).then(()=>{ if(view==="template") render(); });
   cloudPull();      // 部署版：開啟時先把雲端共用範本拉下來（試用版會自動略過）
-  validateSession(); // 確認本機保存的登入是否仍有效（過期就清掉）
 })();
